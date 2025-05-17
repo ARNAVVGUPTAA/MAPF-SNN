@@ -10,7 +10,7 @@ class GNNDataLoader:
     def __init__(self, config):
         self.config = config
 
-        train_set = CreateDataset(self.config, "train")
+        train_set = CreateGNNDataset(self.config, "train")
 
         self.train_loader = DataLoader(
             train_set,
@@ -20,14 +20,29 @@ class GNNDataLoader:
             pin_memory=True,
         )
 
+class SNNDataLoader:
+    def __init__(self, config):
+        self.config = config
 
-class CreateDataset(data.Dataset):
+        valid_set = CreateSNNDataset(self.config, "valid")
+
+        self.train_loader = DataLoader(
+            valid_set,
+            batch_size=self.config["batch_size"],
+            shuffle=False,
+            num_workers=self.config["num_workers"],
+            pin_memory=True,
+        )
+
+class CreateSNNDataset(data.Dataset):
     def __init__(self, config, mode):
         """
         Args:
-            dir_path (string): Path to the directory with the cases.
-            A case dir contains the states and trajectories of the agents
+            config (dict): Configuration dictionary.
+            mode (str): "train" or "valid"
         """
+        self.count = 0
+        self.skipped = 0
         self.config = config[mode]
         self.dir_path = self.config["root_dir"]
         if mode == "valid":
@@ -35,7 +50,13 @@ class CreateDataset(data.Dataset):
         elif mode == "train":
             self.dir_path = os.path.join(self.dir_path, "train")
 
-        self.cases = os.listdir(self.dir_path)
+        self.cases = [
+            d for d in os.listdir(self.dir_path)
+            if d.startswith("case_") and
+               os.path.exists(os.path.join(self.dir_path, d, "states.npy")) and
+               os.path.exists(os.path.join(self.dir_path, d, "trajectory_record.npy")) and
+               os.path.exists(os.path.join(self.dir_path, d, "gso.npy"))
+        ]
         self.states = np.zeros(
             (
                 len(self.cases),
@@ -60,14 +81,133 @@ class CreateDataset(data.Dataset):
         self.count = 0
 
         for i, case in enumerate(self.cases):
-            if os.path.exists(os.path.join(self.dir_path, case, "states.npy")):
-                state = np.load(os.path.join(self.dir_path, case, "states.npy"))
+            try:
+                state_path = os.path.join(self.dir_path, case, "states.npy")
+                tray_path = os.path.join(self.dir_path, case, "trajectory_record.npy")
+                gso_path = os.path.join(self.dir_path, case, "gso.npy")
+                if not (os.path.exists(state_path) and os.path.exists(tray_path) and os.path.exists(gso_path)):
+                    print(f"Warning: Missing file(s) for {case}, skipping.")
+                    self.skipped += 1
+                    continue
+                state = np.load(state_path)
+                tray = np.load(tray_path)
+                gso = np.load(gso_path)
                 state = state[1 : self.config["min_time"] + 1, :, :, :, :]
-                tray = np.load(
-                    os.path.join(self.dir_path, case, "trajectory_record.npy")
-                )
                 tray = tray[:, : self.config["min_time"]]
-                gso = np.load(os.path.join(self.dir_path, case, "gso.npy"))
+                gso = gso[
+                    : self.config["min_time"], 0, :, :
+                ]  # select the first agent since all agents have the same gso
+                gso = gso + np.eye(self.config["nb_agents"])  # add self loop
+                if (
+                    state.shape[0] < self.config["min_time"]
+                    or tray.shape[1] < self.config["min_time"]
+                ):
+                    continue
+                if (
+                    state.shape[0] > self.config["max_time_dl"]
+                    or tray.shape[1] > self.config["max_time_dl"]
+                ):
+                    continue
+                assert (
+                    state.shape[0] == tray.shape[1]
+                ), f"(before transform) Missmatch between states and trajectories: {state.shape[0]} != {tray.shape[1]}"
+                self.states[i, :, :, :, :, :] = state
+                self.trajectories[i, :, :] = tray.T
+                self.gsos[i, :, :, :] = gso
+                self.count += 1
+            except Exception as e:
+                print(f"Error loading {case}: {e}, skipping.")
+                self.skipped += 1
+                continue
+
+        self.states = self.states[: self.count, :, :, :, :, :]
+        self.trajectories = self.trajectories[: self.count, :, :]
+        self.gsos = self.gsos[: self.count, :, :, :]
+        # Do NOT reshape here; keep temporal structure
+        assert (
+            self.states.shape[0] == self.trajectories.shape[0]
+        ), f"(after transform) Missmatch between states and trajectories: {self.states.shape[0]} != {self.trajectories.shape[0]}"
+        print(f"Zeros: {self.statistics()}")
+        print(f"Loaded {self.count} cases")
+
+        print(f"Skipped {self.skipped} cases due to missing files or invalid data.")
+
+    def statistics(self):
+        zeros = np.count_nonzero(self.trajectories == 0)
+        return zeros / (self.trajectories.shape[0] * self.trajectories.shape[1])
+
+    def __len__(self):
+        return self.count
+
+    def __getitem__(self, index):
+        """
+        Returns the whole case
+        state : (time, agents, channels, dimX, dimY),
+        trayec: (time, agents)
+        gsos: (time, agents, nodes, nodes)
+        """
+        states = torch.from_numpy(self.states[index]).float()
+        trayec = torch.from_numpy(self.trajectories[index]).float()
+        gsos = torch.from_numpy(self.gsos[index]).float()
+        return states, trayec, gsos
+
+class CreateGNNDataset(data.Dataset):
+    def __init__(self, config, mode):
+        """
+        Args:
+            dir_path (string): Path to the directory with the cases.
+            A case dir contains the states and trajectories of the agents
+        """
+        self.config = config[mode]
+        self.dir_path = self.config["root_dir"]
+        if mode == "valid":
+            self.dir_path = os.path.join(self.dir_path, "val")
+        elif mode == "train":
+            self.dir_path = os.path.join(self.dir_path, "train")
+
+        self.cases = [
+            d for d in os.listdir(self.dir_path)
+            if d.startswith("case_") and
+               os.path.exists(os.path.join(self.dir_path, d, "states.npy")) and
+               os.path.exists(os.path.join(self.dir_path, d, "trajectory_record.npy")) and
+               os.path.exists(os.path.join(self.dir_path, d, "gso.npy"))
+        ]
+        self.states = np.zeros(
+            (
+                len(self.cases),
+                self.config["min_time"],
+                self.config["nb_agents"],
+                2,
+                5,
+                5,
+            )
+        )  # case x time x agent x channels x dimX x dimy
+        self.trajectories = np.zeros(
+            (len(self.cases), self.config["min_time"], self.config["nb_agents"])
+        )  # case x time x agent
+        self.gsos = np.zeros(
+            (
+                len(self.cases),
+                self.config["min_time"],
+                self.config["nb_agents"],
+                self.config["nb_agents"],
+            )
+        )  # case x time x agent x nodes x nodes
+        self.count = 0
+
+        for i, case in enumerate(self.cases):
+            try:
+                state_path = os.path.join(self.dir_path, case, "states.npy")
+                tray_path = os.path.join(self.dir_path, case, "trajectory_record.npy")
+                gso_path = os.path.join(self.dir_path, case, "gso.npy")
+                if not (os.path.exists(state_path) and os.path.exists(tray_path) and os.path.exists(gso_path)):
+                    print(f"Warning: Missing file(s) for {case}, skipping.")
+                    continue
+                state = np.load(state_path)
+                tray = np.load(tray_path)
+                gso = np.load(gso_path)
+                state = state[1 : self.config["min_time"] + 1, :, :, :, :]
+                tray = tray[:, : self.config["min_time"]]
                 gso = gso[
                     : self.config["min_time"], 0, :, :
                 ]  # select the first agent since all agents have the same gso
@@ -90,6 +230,9 @@ class CreateDataset(data.Dataset):
                 self.trajectories[i, :, :] = tray.T
                 self.gsos[i, :, :, :] = gso
                 self.count += 1
+            except Exception as e:
+                print(f"Error loading {case}: {e}, skipping.")
+                continue
 
         self.states = self.states[: self.count, :, :, :, :, :]
         self.trajectories = self.trajectories[: self.count, :, :]
@@ -149,3 +292,4 @@ if __name__ == "__main__":
     print("Valid:")
     print(f"Feature batch shape: {valid_features.size()}")
     print(f"Labels batch shape: {valid_labels.size()}")
+#print("DEBUG net_type:", self.net_type, "layer:", layer, "neuron:", neuron)

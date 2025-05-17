@@ -44,19 +44,28 @@ def parse_trayectories(schedule):
 
 def parse_traject(path):
     cases = os.listdir(path)
-    print("Parsing trayectories")
-    for i in range(len(cases)):
-        with open(os.path.join(path, rf"case_{i}\solution.yaml")) as states_file:
-            schedule = yaml.load(states_file, Loader=yaml.FullLoader)
+    print("Parsing trajectories")
+    for i in range(1, len(cases)):
+        try:
+            case_path = os.path.join(path, f"case_{i}")
+            solution_file = os.path.join(case_path, "solution.yaml")
+            if not os.path.exists(solution_file):
+                print(f"Warning: {solution_file} does not exist, skipping.")
+                continue
+            with open(solution_file) as states_file:
+                schedule = yaml.load(states_file, Loader=yaml.FullLoader)
 
-        combined_schedule = {}
-        combined_schedule.update(schedule["schedule"])
+            combined_schedule = {}
+            combined_schedule.update(schedule["schedule"])
 
-        t, s = parse_trayectories(combined_schedule)
-        np.save(os.path.join(path, rf"case_{i}\trajectory.npy"), t)
+            t, s = parse_trayectories(combined_schedule)
+            np.save(os.path.join(case_path, "trajectory.npy"), t)
+        except Exception as e:
+            print(f"Error processing case_{i}: {e}")
+            continue
         if i % 25 == 0:
-            print(f"Trajectoty -- [{i}/{len(cases)}]")
-    print(f"Trayectoty -- [{i}/{len(cases)}]")
+            print(f"Trajectory -- [{i}/{len(cases)}]")
+    print(f"Trayectory -- [{i}/{len(cases)}]")
 
 
 if __name__ == "__main__":
@@ -67,7 +76,7 @@ if __name__ == "__main__":
 
     # with open(args.schedule) as states_file:
     #     schedule = yaml.load(states_file, Loader=yaml.FullLoader)
-    path = rf"dataset\obs_test"
+    path = f"dataset/obs_test"
     cases = 200
     config = {}
     parse_traject(path)

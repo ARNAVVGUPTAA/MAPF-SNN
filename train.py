@@ -16,11 +16,18 @@ from torch import nn
 from torch import optim
 
 from grid.env_graph_gridv1 import GraphEnv, create_goals, create_obstacles
-from data_loader import GNNDataLoader
+from data_loader import GNNDataLoader, SNNDataLoader
 
+from spikingjelly.activation_based import learning
 
-with open(r"configs\config_gnn_test.yaml", "r") as config_path:
-    config = yaml.load(config_path, Loader=yaml.FullLoader)
+import argparse
+
+parser = argparse.ArgumentParser()
+parser.add_argument('--config', type=str, default="configs/config_snn.yaml")
+args = parser.parse_args()
+
+with open(args.config, "r") as config_path:
+    config = yaml.safe_load(config_path)
 
 net_type = config["net_type"]
 exp_name = config["exp_name"]
@@ -33,7 +40,8 @@ if net_type == "baseline":
 elif net_type == "gnn":
     # from models.framework_gnn import Network
     from models.framework_gnn_message import Network
-
+elif net_type == "snn":
+    from models.framework_snn import Network
 
 if not os.path.exists(rf"results\{exp_name}"):
     os.makedirs(rf"results\{exp_name}")
@@ -44,10 +52,27 @@ with open(rf"results\{exp_name}\config.yaml", "w") as config_path:
 if __name__ == "__main__":
 
     print("----- Training stats -----")
-    data_loader = GNNDataLoader(config)
+    if(net_type == "gnn"):
+        data_loader = GNNDataLoader(config)
+    elif(net_type == "snn"):
+        data_loader = SNNDataLoader(config)
     model = Network(config)
-    optimizer = optim.Adam(model.parameters(), lr=3e-4, weight_decay=1e-4)
-    criterion = nn.CrossEntropyLoss()
+    if net_type == "snn":
+        # Use your SNN-specific optimizer or learning rule here
+        stdp = learning.STDPLearner(
+            synapse=model.fc_out,
+            sn=model.out_neuron,
+            step_mode='s',
+            tau_pre=20.0,
+            tau_post=20.0,
+            f_pre=lambda w: 1.0,   # <--- Use a lambda function
+            f_post=lambda w: -1.0  # <--- Use a lambda function
+        )
+        optimizer = stdp  # Placeholder
+        criterion = None  # Placeholder
+    else:
+        optimizer = optim.Adam(model.parameters(), lr=3e-4, weight_decay=1e-4)
+        criterion = nn.CrossEntropyLoss()
 
     model.to(config["device"])
 
@@ -62,20 +87,34 @@ if __name__ == "__main__":
         model.train()
         train_loss = 0
         for i, (states, trajectories, gso) in enumerate(data_loader.train_loader):
-            optimizer.zero_grad()
-            states = states.to(config["device"])
-            trajectories = trajectories.to(config["device"])
-            gso = gso.to(config["device"])
-            output = model(states, gso)
+            if net_type == "snn":
+                states = states.to(config["device"])
+                gso = gso.to(config["device"])
+                # Forward pass to get spikes from the layer you want to update
+                output, spikes = model(states, gso, return_spikes=True)  # You may need to modify your model to return spikes
+                # Print spike shapes for debugging
+                print("pre_spikes shape:", spikes['pre'].shape)
+                print("post_spikes shape:", spikes['post'].shape)
+                # Flatten batch and agent dimensions if needed
+                pre = spikes['pre'].reshape(-1, spikes['pre'].shape[-1])
+                post = spikes['post'].reshape(-1, spikes['post'].shape[-1])
+                # Call STDP update
+                stdp.step(pre, post)
+            else:
+                optimizer.zero_grad()
+                states = states.to(config["device"])
+                trajectories = trajectories.to(config["device"])
+                gso = gso.to(config["device"])
+                output = model(states, gso)
 
-            total_loss = torch.zeros(1, requires_grad=True)
-            for agent in range(trajectories.shape[1]):
-                loss = criterion(output[:, agent, :], trajectories[:, agent].long())
-                total_loss = total_loss + (loss / trajectories.shape[1])
+                total_loss = torch.zeros(1, requires_grad=True)
+                for agent in range(trajectories.shape[1]):
+                    loss = criterion(output[:, agent, :], trajectories[:, agent].long())
+                    total_loss = total_loss + (loss / trajectories.shape[1])
 
-            total_loss.backward()
-            train_loss += total_loss
-            optimizer.step()
+                total_loss.backward()
+                train_loss += total_loss
+                optimizer.step()
         print(f"Loss: {train_loss.item()}")
         losses.append(train_loss.item())
 

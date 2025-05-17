@@ -141,7 +141,7 @@ def create_solutions(path, num_cases, config):
 
 if __name__ == "__main__":
 
-    path = rf"dataset\obs_test"
+    path = f"dataset/obs_test"
     config = {
         "device": "cpu",
         "num_agents": 3,

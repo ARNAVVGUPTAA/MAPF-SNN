@@ -1,0 +1,35 @@
+batch_size: 128
+board_size:
+- 18
+- 18
+device: !!python/object/apply:torch.device
+- cpu
+epochs: 50
+exp_name: trained_models/snn_experiment
+hidden_dim: 128
+input_dim: 5
+map_shape:
+- 5
+- 5
+max_steps: 32
+max_time: 32
+min_time: 1
+net_type: snn
+num_actions: 5
+num_agents: 5
+num_workers: 3
+obstacles: 5
+sensing_range: 6
+tests_episodes: 100
+train:
+  max_time_dl: 25
+  min_time: 5
+  mode: train
+  nb_agents: 5
+  root_dir: dataset/5_8_28
+valid:
+  max_time_dl: 25
+  min_time: 5
+  mode: valid
+  nb_agents: 5
+  root_dir: dataset/5_8_28
