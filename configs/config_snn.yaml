@@ -2,7 +2,7 @@ exp_name: 'trained_models/snn_experiment'  # Use forward slashes (works on all O
 
 # RSNN parameters — Add these
 net_type: 'snn'            # ✅ Key change to activate framework_snn.py
-input_dim: 9              # ✅ Assuming 9x9 local FOV per agent (adjust as needed)
+input_dim: 50              # ✅ Assuming 9x9 local FOV per agent (adjust as needed)
 hidden_dim: 128            # Hidden size in SNN layer
 num_actions: 5             # Assuming 5 possible movements (up, down, left, right, stay)
 
@@ -14,8 +14,8 @@ tests_episodes: 100
 device: cuda               # or 'cpu' if CUDA not available
 
 # Simulation
-board_size: [18,18]
-map_shape: [5,5]
+board_size: [28,28]
+map_shape: [9,9]
 num_agents: 5
 obstacles: 5
 max_steps: 32
@@ -32,9 +32,11 @@ train:
     min_time: 5
     max_time_dl: 25
     nb_agents: 5
+    batch_size: 32
 valid:
     root_dir: 'dataset/5_8_28'
     mode: 'valid'
     min_time: 5
     max_time_dl: 25
     nb_agents: 5
+    batch_size: 8

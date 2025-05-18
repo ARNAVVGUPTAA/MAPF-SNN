@@ -1,46 +1,21 @@
 import sys
-
-sys.path.append("")
 import os
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 import yaml
 import torch
 import argparse
 import numpy as np
 from cbs.cbs import Environment, CBS
+import multiprocessing
+import shutil
 
 """
-agents:
--   start: [0, 0]
-    goal: [8, 8]
-    name: agent0
--   start: [2, 7]
-    goal: [0, 0]
-    name: agent1
--   start: [6, 7]
-    goal: [0, 2]
-    name: agent3
-map:
-    dimensions: [10, 10]
-    obstacles:
-    - !!python/tuple [0, 1]
-    - !!python/tuple [2, 1]
-    - !!python/tuple [5, 5]
-
+MAPF Data Generation with CBS and Timeout/Retry
 """
 
 
 def gen_input(dimensions: tuple[int, int], nb_obs: int, nb_agents: int) -> dict:
-
-    """
-    basic_agent = {
-        "start":[0,0],
-        "goal":[1,1],
-        "name":"agent1"
-        }
-    """
-
     input_dict = {"agents": [], "map": {"dimensions": dimensions, "obstacles": []}}
-
     starts = []
     goals = []
     obstacles = []
@@ -93,22 +68,37 @@ def gen_input(dimensions: tuple[int, int], nb_obs: int, nb_agents: int) -> dict:
         )
 
     return input_dict
-    # OBS 0 for now
 
 
-def data_gen(input_dict, output_path):
+def cbs_search_worker(env, result_queue):
+    cbs = CBS(env, verbose=False)
+    solution = cbs.search()
+    result_queue.put(solution)
 
-    os.makedirs(output_path)
+
+def data_gen(input_dict, output_path, timeout=30):
+    os.makedirs(output_path, exist_ok=True)
     param = input_dict
     dimension = param["map"]["dimensions"]
     obstacles = param["map"]["obstacles"]
     agents = param["agents"]
 
     env = Environment(dimension, agents, obstacles)
+    result_queue = multiprocessing.Queue()
+    p = multiprocessing.Process(target=cbs_search_worker, args=(env, result_queue))
+    p.start()
+    p.join(timeout)
+    if p.is_alive():
+        print(f" CBS timed out for {output_path}, skipping.")
+        p.terminate()
+        p.join()
+        return
 
-    # Searching
-    cbs = CBS(env, verbose=False)
-    solution = cbs.search()
+    if result_queue.empty():
+        print(" Solution not found")
+        return
+
+    solution = result_queue.get()
     if not solution:
         print(" Solution not found")
         return
@@ -118,29 +108,41 @@ def data_gen(input_dict, output_path):
     output["schedule"] = solution
     output["cost"] = env.compute_solution_cost(solution)
     solution_path = os.path.join(output_path, "solution.yaml")
-    with open(solution_path, "w") as solution_path:
-        yaml.safe_dump(output, solution_path)
+    with open(solution_path, "w") as solution_path_f:
+        yaml.safe_dump(output, solution_path_f)
 
     parameters_path = os.path.join(output_path, "input.yaml")
-    with open(parameters_path, "w") as parameters_path:
-        yaml.safe_dump(param, parameters_path)
+    with open(parameters_path, "w") as parameters_path_f:
+        yaml.safe_dump(param, parameters_path_f)
 
 
-def create_solutions(path, num_cases, config):
+def create_solutions(path, num_cases, config, max_attempts=5, timeout=30):
+    os.makedirs(path, exist_ok=True)
     cases_ready = len(os.listdir(path))
     print("Generating solutions")
-    for i in range(cases_ready + 1, num_cases):
+    for i in range(cases_ready, num_cases):
         if i % 25 == 0:
             print(f"Solution -- [{i}/{num_cases}]")
-        inpt = gen_input(
-            config["map_shape"], config["nb_obstacles"], config["nb_agents"]
-        )
-        data_gen(inpt, os.path.join(path, f"case_{i}"))
+        for attempt in range(max_attempts):
+            inpt = gen_input(
+                config["map_shape"], config["nb_obstacles"], config["nb_agents"]
+            )
+            case_path = os.path.join(path, f"case_{i}")
+            if os.path.exists(case_path):
+                shutil.rmtree(case_path)
+            data_gen(inpt, case_path, timeout=timeout)
+            if os.path.exists(os.path.join(case_path, "solution.yaml")):
+                break
+            else:
+                print(f"Retrying case {i} (attempt {attempt+1}/{max_attempts})")
+        else:
+            print(
+                f"Case {i}: Failed to generate a solvable instance after {max_attempts} attempts, skipping."
+            )
     print(f"Cases stored in {path}")
 
 
 if __name__ == "__main__":
-
     path = f"dataset/obs_test"
     config = {
         "device": "cpu",

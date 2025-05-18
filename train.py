@@ -1,14 +1,10 @@
 import sys
-
-sys.path.append(r"C:\Users\victo\Desktop\VU master\MLGP\Extra")
-sys.path.append(r"C:\Users\victo\Desktop\VU master\MLGP\Extra\models")
-
 import os
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 import time
 import yaml
 import numpy as np
 from tqdm import tqdm
-from pprint import pprint
 import matplotlib.pyplot as plt
 
 import torch
@@ -18,9 +14,11 @@ from torch import optim
 from grid.env_graph_gridv1 import GraphEnv, create_goals, create_obstacles
 from data_loader import GNNDataLoader, SNNDataLoader
 
-from spikingjelly.activation_based import learning
+from spikingjelly.activation_based import learning, functional
 
 import argparse
+
+from models.surrogate_snn import SurrogateSNN
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--config', type=str, default="configs/config_snn.yaml")
@@ -36,45 +34,55 @@ config["device"] = torch.device("cuda:0" if torch.cuda.is_available() else "cpu"
 
 if net_type == "baseline":
     from models.framework_baseline import Network
-
 elif net_type == "gnn":
-    # from models.framework_gnn import Network
     from models.framework_gnn_message import Network
 elif net_type == "snn":
     from models.framework_snn import Network
 
-if not os.path.exists(rf"results\{exp_name}"):
-    os.makedirs(rf"results\{exp_name}")
+results_path = os.path.join("results", exp_name)
+os.makedirs(results_path, exist_ok=True)
 
-with open(rf"results\{exp_name}\config.yaml", "w") as config_path:
+with open(os.path.join(results_path, "config.yaml"), "w") as config_path:
     yaml.dump(config, config_path)
 
 if __name__ == "__main__":
-
     print("----- Training stats -----")
-    if(net_type == "gnn"):
+    if net_type == "gnn":
         data_loader = GNNDataLoader(config)
-    elif(net_type == "snn"):
+    elif net_type == "snn":
+        # Initialize SNN data loader and infer channel dimensions from data
         data_loader = SNNDataLoader(config)
+        # Sample first batch to get C, H, W
+        sample_states, _, _ = next(iter(data_loader.train_loader))
+        shape = sample_states.shape
+        if len(shape) == 6:
+            _, _, _, C, H, W = shape
+        elif len(shape) == 5:
+            _, C, H, W = shape
+        else:
+            raise RuntimeError(f"Unexpected SNN data shape: {shape}")
+        config["channels"] = C
+        config["height"] = H
+        config["width"] = W
+    else:
+        data_loader = None  # baseline case or others
     model = Network(config)
+    model.to(config["device"])
+
     if net_type == "snn":
-        # Use your SNN-specific optimizer or learning rule here
-        stdp = learning.STDPLearner(
-            synapse=model.fc_out,
-            sn=model.out_neuron,
-            step_mode='s',
-            tau_pre=20.0,
-            tau_post=20.0,
-            f_pre=lambda w: 1.0,   # <--- Use a lambda function
-            f_post=lambda w: -1.0  # <--- Use a lambda function
-        )
-        optimizer = stdp  # Placeholder
-        criterion = None  # Placeholder
+        # Use SurrogateSNN and Adam optimizer as per prompt
+        channels = config.get("channels", 1)
+        height = config.get("height", config["board_size"])
+        width = config.get("width", config["board_size"])
+        num_actions = config.get("num_actions", 5)
+        device = config["device"]
+        epochs = config["epochs"]
+        model = SurrogateSNN(input_shape=(channels, height, width), num_classes=num_actions).to(device)
+        optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+        loss_fn = nn.CrossEntropyLoss()
     else:
         optimizer = optim.Adam(model.parameters(), lr=3e-4, weight_decay=1e-4)
         criterion = nn.CrossEntropyLoss()
-
-    model.to(config["device"])
 
     losses = []
     success_rate_final = []
@@ -82,44 +90,60 @@ if __name__ == "__main__":
 
     for epoch in range(config["epochs"]):
         print(f"Epoch {epoch}")
-
-        # ##### Training #########
         model.train()
-        train_loss = 0
-        for i, (states, trajectories, gso) in enumerate(data_loader.train_loader):
-            if net_type == "snn":
-                states = states.to(config["device"])
-                gso = gso.to(config["device"])
-                # Forward pass to get spikes from the layer you want to update
-                output, spikes = model(states, gso, return_spikes=True)  # You may need to modify your model to return spikes
-                # Print spike shapes for debugging
-                print("pre_spikes shape:", spikes['pre'].shape)
-                print("post_spikes shape:", spikes['post'].shape)
-                # Flatten batch and agent dimensions if needed
-                pre = spikes['pre'].reshape(-1, spikes['pre'].shape[-1])
-                post = spikes['post'].reshape(-1, spikes['post'].shape[-1])
-                # Call STDP update
-                stdp.step(pre, post)
-            else:
-                optimizer.zero_grad()
-                states = states.to(config["device"])
-                trajectories = trajectories.to(config["device"])
-                gso = gso.to(config["device"])
-                output = model(states, gso)
+        if net_type == "snn":
+            train_loss = 0.0
+            for states, trajectories, _ in data_loader.train_loader:
+                # states: [batch, T, agents, C, H, W]
+                batch, T, agents, C, H, W = states.shape
+                states = states.to(device)
+                trajectories = trajectories.to(device)  # [batch, agents]
 
-                total_loss = torch.zeros(1, requires_grad=True)
+                # Reset and forward through time
+                functional.reset_net(model)
+                # Compute average loss over time steps and agents instead of summing
+                loss_batch = torch.zeros(1, device=device)
+                for t in range(T):
+                    fov_t = states[:, t]  # [batch, agents, C, H, W]
+                    # Treat each agent as separate sample within batch
+                    x_t = fov_t.reshape(batch * agents, C, H, W)
+                    out_t = model(x_t)  # [batch*agents, num_actions]
+                    out_t = out_t.reshape(batch, agents, -1)
+                    # sum loss over agents and normalize by agent count
+                    loss_t = 0
+                    for a in range(agents):
+                        loss_t += loss_fn(out_t[:, a, :], trajectories[:, a])
+                    loss_batch += loss_t / agents
+                # average over time steps
+                loss_batch = loss_batch / T
+
+                # Backprop and step
+                optimizer.zero_grad()
+                loss_batch.backward()
+                optimizer.step()
+                train_loss += loss_batch.item()
+                print(f"Epoch {epoch}, Loss: {loss_batch.item():.4f}")
+            losses.append(train_loss)
+        else:
+            train_loss = 0.0
+            for i, (states, trajectories, gso) in enumerate(data_loader.train_loader):
+                states = states.to(config["device"])
+                gso = gso.to(config["device"])
+
+                # Remove SNN+STDP logic, keep only standard supervised learning for non-SNN
+                optimizer.zero_grad()
+                trajectories = trajectories.to(config["device"])
+                output = model(states, gso)
+                total_loss = torch.zeros(1, requires_grad=True).to(config["device"])
                 for agent in range(trajectories.shape[1]):
                     loss = criterion(output[:, agent, :], trajectories[:, agent].long())
                     total_loss = total_loss + (loss / trajectories.shape[1])
-
                 total_loss.backward()
-                train_loss += total_loss
                 optimizer.step()
-        print(f"Loss: {train_loss.item()}")
-        losses.append(train_loss.item())
+                train_loss += total_loss.item()
+            print(f"Loss: {train_loss}")
+            losses.append(train_loss)
 
-        ######### Validation #########
-        val_loss = 0
         model.eval()
         success_rate = []
         flow_time = []
@@ -129,19 +153,25 @@ if __name__ == "__main__":
             env = GraphEnv(config, goal=goals, obstacles=obstacles)
             emb = env.getEmbedding()
             obs = env.reset()
-            for i in range(config["max_steps"]):
-                fov = torch.tensor(obs["fov"]).float().unsqueeze(0).to(config["device"])
-                gso = (
-                    torch.tensor(obs["adj_matrix"])
-                    .float()
-                    .unsqueeze(0)
-                    .to(config["device"])
-                )
+            if net_type == "snn":
+                functional.reset_net(model)
+
+            for step_idx in range(config["max_steps"]):
+                current_fov_tensor = torch.tensor(obs["fov"]).float().to(config["device"])
+                # For SNN, keep spatial shape: [agents, C, H, W]
+                fov_for_model = current_fov_tensor  # shape [agents, C, H, W]
+                gso_for_model = torch.tensor(obs["adj_matrix"]).float().unsqueeze(0).to(config["device"])
+
                 with torch.no_grad():
-                    action = model(fov, gso)
-                action = action.cpu().squeeze(0).numpy()
-                action = np.argmax(action, axis=1)
-                obs, reward, done, info = env.step(action, emb)
+                    if net_type == "snn":
+                        functional.reset_net(model)
+                        action_logits = model(fov_for_model)
+                    else:
+                        action_logits = model(fov_for_model, gso_for_model)
+
+                action_np = action_logits.cpu().numpy()
+                action_indices = np.argmax(action_np, axis=1)
+                obs, reward, done, info = env.step(action_indices, emb)
                 if done:
                     break
 
@@ -149,19 +179,16 @@ if __name__ == "__main__":
             success_rate.append(metrics[0])
             flow_time.append(metrics[1])
 
-        success_rate = np.mean(success_rate)
-        flow_time = np.mean(flow_time)
-        success_rate_final.append(success_rate)
-        flow_time_final.append(flow_time)
-        print(f"Success rate: {success_rate}")
-        print(f"Flow time: {flow_time}")
+        success_rate_mean = np.mean(success_rate)
+        flow_time_mean = np.mean(flow_time)
+        success_rate_final.append(success_rate_mean)
+        flow_time_final.append(flow_time_mean)
+        print(f"Success rate: {success_rate_mean}")
+        print(f"Flow time: {flow_time_mean}")
 
-    loss = np.array(losses)
-    success_rate = np.array(success_rate_final)
-    flow_time = np.array(flow_time_final)
 
-    np.save(rf"results\{exp_name}\success_rate.npy", success_rate)
-    np.save(rf"results\{exp_name}\flow_time.npy", flow_time)
-    np.save(rf"results\{exp_name}\loss.npy", loss)
 
-    torch.save(model.state_dict(), rf"results\{exp_name}\model.pt")
+    np.save(os.path.join(results_path, "success_rate.npy"), np.array(success_rate_final))
+    np.save(os.path.join(results_path, "flow_time.npy"), np.array(flow_time_final))
+    np.save(os.path.join(results_path, "loss.npy"), np.array(losses))
+    torch.save(model.state_dict(), os.path.join(results_path, "model.pt"))
