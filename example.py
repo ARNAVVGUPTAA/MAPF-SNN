@@ -12,7 +12,7 @@ from grid.env_graph_gridv1 import GraphEnv, create_goals, create_obstacles
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", type=str, default="configs/config_gnn.yaml")
+    parser.add_argument("--config", type=str, default="configs/config_snn.yaml")
     args = parser.parse_args()
 
     with open(args.config, "r") as config_path:

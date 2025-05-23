@@ -40,3 +40,50 @@ valid:
     max_time_dl: 25
     nb_agents: 5
     batch_size: 8
+
+# SNN neuron parameters
+lif_tau: 7.0           # Membrane time constant (tau)
+lif_v_reset: 0.2       # Reset voltage after spike
+lif_v_threshold: 0.4   # Firing threshold
+
+# SNN neuron scaling factors (multipliers on lif_tau)
+lif_scale_conv1: 1.0       # conv1 uses base lif_tau
+lif_scale_conv2: 0.75      # conv2 multiplier
+lif_scale_conv3: 0.6       # conv3 multiplier
+lif_scale_feedback: 0.5    # feedback LIF multiplier
+lif_scale_attention: 0.5   # recurrent attention LIF multiplier
+lif_scale_conv4: 0.75      # conv4 LIF multiplier
+
+# Surrogate gradient parameters
+surrogate_alpha: 4.0        # slope alpha for Sigmoid surrogate function
+
+# Convolution kernel sizes (if wanting to parameterize)
+# conv1_kernel: 7
+# conv2_kernel: 5
+# conv3_kernel: 3
+# conv4_kernel: 5
+# feedback_kernel: 1
+
+# Residual block channels and kernels
+# res_block_channels: 256
+# res_block_kernel: 3
+
+# Synapse Filter
+syn_tau: 5.0               # Synaptic time constant
+
+# Transformer parameters
+transformer_nhead: 5      # Number of attention heads
+transformer_ff_dim: 512    # Feedforward dimension in Transformer layers
+transformer_layers: 4      # Number of layers in first transformer
+transformer2_layers: 3     # Number of layers in second transformer
+
+# Training hyperparameters
+learning_rate: 1e-2     # Learning rate for optimizer
+weight_decay: 1e-3      # Weight decay for optimizer
+spike_reg_weight: 0.5   # L1 regularization weight for spikes
+
+# Learning rate schedule and early stopping
+lr_decay_factor: 0.5         # Factor to reduce LR when plateauing
+lr_patience: 5               # Number of epochs with no improvement before LR decay
+early_stop_patience: 15      # Number of epochs to wait for min success rate
+early_stop_threshold: 0.1    # Minimum success rate required within patience

@@ -4,9 +4,25 @@ sys.path.append(r"..\Extra")
 
 from pprint import pprint
 import numpy as np
-from models.gnn import GCNLayer
 from env_graph_gridv1 import GraphEnv
 import time
+
+# define GCNLayer inline (removing external import)
+class GCNLayer:
+    def __init__(self, n_nodes, in_features, out_features):
+        self.n_nodes = n_nodes
+        self.in_features = in_features
+        self.out_features = out_features
+
+    def forward(self, adj_matrix, node_feats, W):
+        # add self-loops and normalize
+        A = adj_matrix + np.eye(self.n_nodes)
+        D_inv_sqrt = np.diag(1.0 / np.sqrt(A.sum(axis=1)))
+        A_norm = D_inv_sqrt @ A @ D_inv_sqrt
+        # graph convolution
+        H = A_norm @ node_feats @ W
+        # nonlinearity
+        return np.tanh(H)
 
 if __name__ == "__main__":
     agents = 16

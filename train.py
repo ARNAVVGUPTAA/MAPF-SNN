@@ -10,27 +10,32 @@ import matplotlib.pyplot as plt
 import torch
 from torch import nn
 from torch import optim
+import torch.nn.functional as F  # Add this import
 
 from grid.env_graph_gridv1 import GraphEnv, create_goals, create_obstacles
 from data_loader import GNNDataLoader, SNNDataLoader
 
 from spikingjelly.activation_based import learning, functional
 
-import argparse
+from config import config
+from models.surrogate_snn import SurrogateSNN, RecurrentLIFNode
 
-from models.surrogate_snn import SurrogateSNN
-
-parser = argparse.ArgumentParser()
-parser.add_argument('--config', type=str, default="configs/config_snn.yaml")
-args = parser.parse_args()
-
-with open(args.config, "r") as config_path:
-    config = yaml.safe_load(config_path)
+def compute_success_rate(success_list):
+    """
+    Compute the average success rate from a list of per-episode successes.
+    Args:
+        success_list (list of float): successes per episode (0.0 to 1.0)
+    Returns:
+        float: average success rate, or 0.0 if list is empty
+    """
+    if not success_list:
+        return 0.0
+    return sum(success_list) / len(success_list)
 
 net_type = config["net_type"]
 exp_name = config["exp_name"]
 tests_episodes = config["tests_episodes"]
-config["device"] = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+# config["device"] = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
 if net_type == "baseline":
     from models.framework_baseline import Network
@@ -77,53 +82,84 @@ if __name__ == "__main__":
         num_actions = config.get("num_actions", 5)
         device = config["device"]
         epochs = config["epochs"]
-        model = SurrogateSNN(input_shape=(channels, height, width), num_classes=num_actions).to(device)
-        optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+        # Retrieve and cast hyperparameters from config
+        lr = float(config.get('learning_rate', 1e-3))
+        wd = float(config.get('weight_decay', 1e-4))
+        optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=wd)
+        # LR scheduler: reduce LR when success rate plateaus
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer,
+            mode='max',
+            factor=float(config.get('lr_decay_factor', 0.5)),
+            patience=int(config.get('lr_patience', 5)),
+            verbose=True
+        )
+        early_stop_counter = 0
         loss_fn = nn.CrossEntropyLoss()
     else:
         optimizer = optim.Adam(model.parameters(), lr=3e-4, weight_decay=1e-4)
         criterion = nn.CrossEntropyLoss()
+        print("Using CrossEntropyLoss okkk")
 
     losses = []
     success_rate_final = []
     flow_time_final = []
 
+    # Removed debug prints and kept only essential logs
     for epoch in range(config["epochs"]):
         print(f"Epoch {epoch}")
         model.train()
         if net_type == "snn":
             train_loss = 0.0
-            for states, trajectories, _ in data_loader.train_loader:
-                # states: [batch, T, agents, C, H, W]
-                batch, T, agents, C, H, W = states.shape
+            total_spikes = 0  # Initialize total spikes counter
+            for i, (states, trajectories, _) in enumerate(data_loader.train_loader):
                 states = states.to(device)
                 trajectories = trajectories.to(device)  # [batch, agents]
 
+                T = states.shape[1]  # Number of time steps
+
                 # Reset and forward through time
                 functional.reset_net(model)
-                # Compute average loss over time steps and agents instead of summing
-                loss_batch = torch.zeros(1, device=device)
+                spike_reg = 0.0  # initialize spike regularization accumulator
+                total_loss = 0.0
+                total_spikes = 0
                 for t in range(T):
-                    fov_t = states[:, t]  # [batch, agents, C, H, W]
-                    # Treat each agent as separate sample within batch
-                    x_t = fov_t.reshape(batch * agents, C, H, W)
-                    out_t = model(x_t)  # [batch*agents, num_actions]
-                    out_t = out_t.reshape(batch, agents, -1)
-                    # sum loss over agents and normalize by agent count
-                    loss_t = 0
-                    for a in range(agents):
-                        loss_t += loss_fn(out_t[:, a, :], trajectories[:, a])
-                    loss_batch += loss_t / agents
-                # average over time steps
-                loss_batch = loss_batch / T
+                    fov_t = states[:, t]
+                    out_t = model(fov_t)
+                    out_t = out_t.view(-1, trajectories.shape[2], model.num_classes)
 
-                # Backprop and step
+                    # compute loss for time step
+                    loss = 0
+                    for agent in range(trajectories.shape[2]):
+                        logits = out_t[:, agent]
+                        targets = trajectories[:, t, agent].long()
+                        loss += F.cross_entropy(logits, targets)
+                    loss /= trajectories.shape[2]
+
+                    # accumulate spike regularization and count spikes
+                    for m in model.modules():
+                        if isinstance(m, RecurrentLIFNode) and m.spike is not None:
+                            spike_reg += m.spike.mean().item()
+                            total_spikes += m.spike.sum().item()
+
+                    total_loss += loss
+                    functional.detach_net(model)
+
+                # average over time
+                total_loss /= T
+                spike_reg /= T  # average regularization over time
+                # include L1 spike regularization in loss
+          
+                total_loss += 0.5 * spike_reg
+
+                # Backpropagation and optimization
                 optimizer.zero_grad()
-                loss_batch.backward()
+                total_loss.backward()
+                nn.utils.clip_grad_norm_(model.parameters(), 5.0)
                 optimizer.step()
-                train_loss += loss_batch.item()
-                print(f"Epoch {epoch}, Loss: {loss_batch.item():.4f}")
-            losses.append(train_loss)
+
+                train_loss += total_loss.item()
+            print(f"Epoch {epoch} | Loss: {total_loss:.4f} | Spikes: {total_spikes} | SpikeReg: {spike_reg:.4f}")
         else:
             train_loss = 0.0
             for i, (states, trajectories, gso) in enumerate(data_loader.train_loader):
@@ -142,51 +178,65 @@ if __name__ == "__main__":
                 optimizer.step()
                 train_loss += total_loss.item()
             print(f"Loss: {train_loss}")
-            losses.append(train_loss)
 
         model.eval()
-        success_rate = []
-        flow_time = []
-        for episode in range(tests_episodes):
-            goals = create_goals(config["board_size"], config["num_agents"])
-            obstacles = create_obstacles(config["board_size"], config["obstacles"])
-            env = GraphEnv(config, goal=goals, obstacles=obstacles)
-            emb = env.getEmbedding()
-            obs = env.reset()
+        # Run test episodes and collect metrics per episode
+        total_agents_reached = 0
+        total_agents_counted = 0
+        episode_success_rates = []
+        episode_flow_times = []
+        for ep in range(tests_episodes):
+            # reset SNN internal state for this episode
             if net_type == "snn":
                 functional.reset_net(model)
 
-            for step_idx in range(config["max_steps"]):
-                current_fov_tensor = torch.tensor(obs["fov"]).float().to(config["device"])
-                # For SNN, keep spatial shape: [agents, C, H, W]
-                fov_for_model = current_fov_tensor  # shape [agents, C, H, W]
-                gso_for_model = torch.tensor(obs["adj_matrix"]).float().unsqueeze(0).to(config["device"])
-
+            # first generate obstacle array, then pick goals avoiding those cells
+            obstacles = create_obstacles(config["board_size"], config.get("obstacles", 0))
+            goals = create_goals(config["board_size"], config["num_agents"], obstacles)
+            env = GraphEnv(config, goal=goals, obstacles=obstacles)
+            emb = env.getEmbedding()
+            obs = env.reset()
+            done = False
+            step_count = 0
+            max_eval_steps = config.get("max_time", 100)
+            while not done and step_count < max_eval_steps:
+                fov_t = torch.tensor(obs["fov"]).float().to(config["device"])
+                gso_t = torch.tensor(obs["adj_matrix"]).float().unsqueeze(0).to(config["device"])
+                # Ensure batch dimension for SNN input
+                if net_type == "snn" and fov_t.dim() == 4:
+                    fov_t = fov_t.unsqueeze(0)
                 with torch.no_grad():
                     if net_type == "snn":
-                        functional.reset_net(model)
-                        action_logits = model(fov_for_model)
+                        logits = model(fov_t)
                     else:
-                        action_logits = model(fov_for_model, gso_for_model)
-
-                action_np = action_logits.cpu().numpy()
-                action_indices = np.argmax(action_np, axis=1)
-                obs, reward, done, info = env.step(action_indices, emb)
-                if done:
-                    break
-
-            metrics = env.computeMetrics()
-            success_rate.append(metrics[0])
-            flow_time.append(metrics[1])
-
-        success_rate_mean = np.mean(success_rate)
-        flow_time_mean = np.mean(flow_time)
-        success_rate_final.append(success_rate_mean)
-        flow_time_final.append(flow_time_mean)
-        print(f"Success rate: {success_rate_mean}")
-        print(f"Flow time: {flow_time_mean}")
-
-
+                        logits = model(fov_t, gso_t)
+                actions = torch.argmax(logits, dim=1).cpu().numpy()
+                obs, _, done, _ = env.step(actions, emb)
+                step_count += 1
+            # episode done or max steps reached, compute metrics
+            sr, ft, tot_agents, num_reached = env.computeMetrics()
+            episode_success_rates.append(sr)
+            episode_flow_times.append(ft)
+            total_agents_reached += num_reached
+            total_agents_counted += tot_agents
+        # aggregate across episodes
+        episode_success_rate = (sum(episode_success_rates) / len(episode_success_rates)) if episode_success_rates else 0.0
+        avg_flow_time = (sum(episode_flow_times) / len(episode_flow_times)) if episode_flow_times else 0.0
+        success_rate_final.append(episode_success_rate)
+        flow_time_final.append(avg_flow_time)
+        print(f"Episode success rate: {episode_success_rate:.4f}")
+        print(f"Average flow time: {avg_flow_time:.2f}")
+        print(f"Total agents reached: {total_agents_reached}/{total_agents_counted}")
+        # Step scheduler and early stop check
+        scheduler.step(episode_success_rate)
+        # Early stopping if success_rate below threshold for many epochs
+        if episode_success_rate < config.get('early_stop_threshold', 0.1):
+            early_stop_counter += 1
+        else:
+            early_stop_counter = 0
+        if early_stop_counter >= config.get('early_stop_patience', 15):
+            print(f"Early stopping: success rate < {config['early_stop_threshold']} for {config['early_stop_patience']} epochs.")
+            break
 
     np.save(os.path.join(results_path, "success_rate.npy"), np.array(success_rate_final))
     np.save(os.path.join(results_path, "flow_time.npy"), np.array(flow_time_final))
