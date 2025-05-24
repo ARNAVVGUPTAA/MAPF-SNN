@@ -71,6 +71,8 @@ if __name__ == "__main__":
         config["width"] = W
     else:
         data_loader = None  # baseline case or others
+    
+    # Create model - framework_snn Network only takes config
     model = Network(config)
     model.to(config["device"])
 
@@ -92,7 +94,6 @@ if __name__ == "__main__":
             mode='max',
             factor=float(config.get('lr_decay_factor', 0.5)),
             patience=int(config.get('lr_patience', 5)),
-            verbose=True
         )
         early_stop_counter = 0
         loss_fn = nn.CrossEntropyLoss()

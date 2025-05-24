@@ -1,6 +1,4 @@
-import sys
 import os
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 import yaml
 import torch
 import argparse
@@ -143,16 +141,24 @@ def create_solutions(path, num_cases, config, max_attempts=5, timeout=30):
 
 
 if __name__ == "__main__":
-    path = f"dataset/obs_test"
-    config = {
-        "device": "cpu",
-        "num_agents": 3,
-        "map_shape": [8, 8],
-        "root_dir": path,
-        "nb_agents": 4,
-        "nb_obstacles": 5,
-    }
-    create_solutions(path, 2, config)
+    from config import config
+    import torch
+
+    config["device"] = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    # Determine dataset path and number of cases from config
+    train_conf = config.get("train", {})
+    path = f"{train_conf.get('root_dir')}/{train_conf.get('mode')}"
+    num_cases = config.get("cases_train", 2)
+    create_solutions(
+        path,
+        num_cases,
+        {
+            "map_shape": config["map_shape"],
+            "nb_agents": config["num_agents"],
+            "nb_obstacles": config.get("obstacles", 0),
+            "device": config["device"],
+        },
+    )
     # create_solutions(path, 2000, config)
     # total = 200
     # for i in range(0,total):

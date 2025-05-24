@@ -1,127 +1,242 @@
 import torch
 import torch.nn as nn
-from spikingjelly.activation_based import neuron, layer
+from spikingjelly.activation_based import neuron, layer, base
+from config import config
 
-# Define AdaptiveLIFNode to handle dynamic batch sizes between training and validation
+
 class AdaptiveLIFNode(neuron.LIFNode):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        # self.v_reset is the scalar initial voltage (e.g., 0.0) stored by LIFNode's __init__.
-        # self.v is also initialized to this scalar value by LIFNode's __init__.
+    """
+    LIF neuron that adapts to different batch sizes between train/validation.
+    Key improvement: Better parameter initialization for consistent spiking.
+    """
+    def __init__(self, tau=None, v_threshold=None, v_reset=None, surrogate_alpha=None, detach_reset=None, *args, **kwargs):
+        # Use config parameters for better spiking
+        super().__init__(
+            tau=tau if tau is not None else config.get('lif_tau', 10.0), 
+            v_threshold=v_threshold if v_threshold is not None else config.get('lif_v_threshold', 0.5), 
+            v_reset=v_reset if v_reset is not None else config.get('lif_v_reset', 0.0),
+            detach_reset=detach_reset if detach_reset is not None else config.get('detach_reset', True),
+            *args, **kwargs
+        )
 
     def reset(self):
-        # Call BaseNode.reset() to reset time step counter (self.t = 0)
-        # and other base properties. BaseNode.reset() also attempts to set
-        # self.v = self.v_init (the initial scalar voltage) if self.v_init was set
-        # (which happens on the first forward pass if self.v was scalar).
+        """Reset to scalar voltage to adapt to new batch sizes"""
         neuron.BaseNode.reset(self)
+        self.v = self.v_reset  # Reset to scalar for shape adaptation
+
+
+class AttentionGate(nn.Module):
+    """
+    Simple attention mechanism to focus on important spatial/feature locations.
+    This helps the SNN pay attention to relevant parts of the input.
+    """
+    def __init__(self, input_dim):
+        super().__init__()
+        self.attention_fc = nn.Linear(input_dim, input_dim)
+        self.gate_fc = nn.Linear(input_dim, input_dim)
         
-        # Crucially, ensure self.v is reset to its original scalar v_reset value.
-        # This makes the neuron forget its previous batch-specific tensor shape.
-        # On the next forward(x) call, if self.v is scalar, BaseNode.forward()
-        # will re-initialize self.v = torch.full_like(x.data, self.v_reset), # Note: SpikingJelly uses self.v_init here
-        # thus adapting to the new input x's shape.
-        self.v = self.v_reset
-
-
-class RSNNBlock(nn.Module):
-    def __init__(self, input_size, hidden_size, tau, time_steps, v_threshold=1.0, detach_reset=True):
-        super(RSNNBlock, self).__init__()
-        self.fc = nn.Linear(input_size, hidden_size)
-        self.lif = AdaptiveLIFNode(tau=tau, v_threshold=v_threshold, detach_reset=detach_reset)
-        self.time_steps = time_steps
-
     def forward(self, x):
-        # x is (batch_size * num_agents, features)
-        # We simulate SNN dynamics over self.time_steps for this static input
-        spk_seq = []
-        # The input x to this block's forward is already the current for the first layer of this block.
-        # If RSNNBlock is meant to be a multi-layer block, the structure would be different.
-        # Assuming fc is the input layer to the LIF neurons for this block.
-        for _ in range(self.time_steps): 
-            current_after_fc = self.fc(x) # This implies x is static over time_steps or fc is applied each time.
-                                          # If x is features that are constant over the SNN sim window,
-                                          # then fc(x) is also constant. This is typical for rate coding from static features.
-            spk = self.lif(current_after_fc) 
-            spk_seq.append(spk)
+        # Compute attention weights
+        attention_weights = torch.sigmoid(self.attention_fc(x))
+        # Compute gating values  
+        gate_values = torch.tanh(self.gate_fc(x))
+        # Apply attention: element-wise multiplication
+        return x + (attention_weights * gate_values * 0.5)  # Residual + attended features
+
+
+class RSNNBlock(base.MemoryModule):
+    """
+    Recurrent SNN block with improved temporal processing and attention.
+    Key improvements:
+    - Multiple time steps for temporal context
+    - Attention mechanism for feature focus
+    - Better parameter scaling
+    """
+    def __init__(self, input_size, hidden_size, cfg=None):
+        super().__init__()
         
-        return torch.stack(spk_seq, dim=0).mean(dim=0)
-
-    def reset(self):
-        self.lif.reset()
-
-
-class Network(nn.Module):
-    def __init__(self, config):
-        super(Network, self).__init__()
-        self.config = config
+        # Get SNN parameters from global config
+        self.time_steps = config.get('snn_time_steps', 3)
+        self.input_scale = config.get('input_scale', 2.0)
         
-        input_dim = config["input_dim"] 
-        hidden_dim = config["hidden_dim"]
-        action_dim = config["num_actions"]
-
-        # SNN specific parameters from config, with defaults
-        snn_time_steps = config.get("snn_time_steps", 10) # Time steps for SNN block simulation
-        tau = config.get("tau", 2.0)
-        v_threshold = config.get("v_threshold", 1.0)
-        detach_reset = config.get("detach_reset", True)
-
-        tau_output = config.get("tau_output", tau) # Default to main tau if not specified
-        v_threshold_output = config.get("v_threshold_output", v_threshold)
-        detach_reset_output = config.get("detach_reset_output", detach_reset)
-
-        # This initial linear layer processes the raw input features (e.g., FOV)
-        # Its output will be the input to the RSNNBlock's internal fc layer if that's the design.
-        # Or, if RSNNBlock's fc is the first processing step, then fc_snn here might be redundant
-        # or intended for a different purpose (e.g. pre-processing before temporal dynamics).
-        # Based on typical usage, an initial fc projects input to hidden_dim, then SNN block operates.
-        self.fc_snn_input_projection = nn.Linear(input_dim, hidden_dim)
+        # Input processing with attention
+        self.attention = AttentionGate(input_size)
+        self.input_fc = nn.Linear(input_size, hidden_size)
         
-        self.snn_block = RSNNBlock(
-            input_size=hidden_dim,  # RSNNBlock's internal fc takes hidden_dim
-            hidden_size=hidden_dim, 
-            tau=tau,
-            time_steps=snn_time_steps,
-            v_threshold=v_threshold, 
-            detach_reset=detach_reset
+        # Main spiking neuron with config parameters
+        self.lif = AdaptiveLIFNode(
+            tau=config.get('lif_tau', 10.0),
+            v_threshold=config.get('lif_v_threshold', 0.5),
+            v_reset=config.get('lif_v_reset', 0.0)
         )
         
-        self.fc_out = nn.Linear(hidden_dim, action_dim) 
+        # Recurrent connection for temporal context
+        self.recurrent_fc = nn.Linear(hidden_size, hidden_size)
         
-        self.out_neuron = AdaptiveLIFNode(
-            tau=tau_output, 
-            v_threshold=v_threshold_output, 
-            detach_reset=detach_reset_output
-        )
-
-    def forward(self, x, gso=None, return_spikes=False):
-        # x shape: (batch_size * num_agents, input_dim)
+        # Output processing
+        self.output_fc = nn.Linear(hidden_size, hidden_size)
         
-        # Project input features to hidden dimension
-        projected_x = self.fc_snn_input_projection(x) # (batch_size * num_agents, hidden_dim)
+    def forward(self, x):
+        """
+        Process input through multiple time steps with attention and recurrence.
+        """
+        self.lif.reset()  # Reset neuron state
         
-        # Process projected input through SNN block (temporal dynamics simulation)
-        snn_block_output = self.snn_block(projected_x)   # (batch_size * num_agents, hidden_dim) - rate coded spikes
+        # Apply attention to input features
+        attended_x = self.attention(x)
         
-        pre_synaptic_potential_out = self.fc_out(snn_block_output) # (batch_size * num_agents, action_dim)
-        post_synaptic_spikes_out = self.out_neuron(pre_synaptic_potential_out) # (batch_size * num_agents, action_dim)
+        # Scale input to encourage spiking - use config value
+        input_current = self.input_fc(attended_x) * self.input_scale
         
-        output = post_synaptic_spikes_out 
-
-        if output.dim() != 2 or output.shape[-1] != self.config["num_actions"]:
-            raise ValueError(f"Unexpected output spikes shape: {output.shape}. Expected 2D tensor with last dim {self.config['num_actions']}")
-
-        if return_spikes:
-            # Return the actual spikes required by STDPLearner
-            # 'in_spike_for_fc_out': input spikes to the plastic layer (fc_out)
-            # 'out_spike_from_out_neuron': output spikes from the post-synaptic neuron (out_neuron)
-            return output, {'in_spike_for_fc_out': snn_block_output, 
-                           'out_spike_from_out_neuron': post_synaptic_spikes_out}
+        spike_accumulator = 0
+        hidden_state = torch.zeros_like(input_current)
+        
+        # Process through multiple time steps for temporal dynamics
+        for t in range(self.time_steps):
+            # Combine input and recurrent currents
+            if t == 0:
+                total_current = input_current
+            else:
+                recurrent_current = self.recurrent_fc(hidden_state) * 0.3  # Gentle recurrence
+                total_current = input_current * 0.7 + recurrent_current  # Weighted combination
+            
+            # Generate spikes
+            spikes = self.lif(total_current)
+            spike_accumulator += spikes
+            hidden_state = spikes  # Update hidden state
+        
+        # Average spikes over time steps for rate coding
+        avg_spikes = spike_accumulator / self.time_steps
+        
+        # Final processing with attention on spike outputs
+        output = self.output_fc(avg_spikes)
         return output
 
     def reset(self):
+        """Reset all stateful components"""
+        self.lif.reset()
+        super().reset()
+
+
+class Network(base.MemoryModule):
+    """
+    Improved SNN for MAPF with better attention and temporal processing.
+    
+    Key improvements:
+    1. Multi-step temporal processing
+    2. Attention mechanisms for focus
+    3. Better parameter tuning for consistent spiking
+    4. Cleaner, more readable architecture
+    """
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        self.num_classes = config["num_actions"]
+        
+        # Network dimensions
+        input_dim = config["input_dim"] 
+        hidden_dim = config["hidden_dim"]
+        action_dim = config["num_actions"]
+        
+        # SNN parameters from config
+        self.time_steps = config.get("snn_time_steps", 3)
+        self.input_scale = config.get("input_scale", 2.0)
+        
+        # Input preprocessing with normalization
+        self.input_norm = nn.LayerNorm(input_dim)
+        self.input_projection = nn.Linear(input_dim, hidden_dim)
+        
+        # Main SNN processing block
+        self.snn_block = RSNNBlock(
+            input_size=hidden_dim,
+            hidden_size=hidden_dim,
+            cfg=config  # Pass entire config
+        )
+        
+        # Output processing with attention
+        self.output_attention = AttentionGate(hidden_dim)
+        self.output_fc = nn.Linear(hidden_dim, action_dim)
+        
+        # Final output neuron with config parameters
+        self.output_neuron = AdaptiveLIFNode(
+            tau=config.get("lif_tau", 10.0) * 0.5,  # Faster dynamics for output
+            v_threshold=config.get("lif_v_threshold", 0.5) * 0.3,  # Lower threshold for output spikes
+            v_reset=config.get("lif_v_reset", 0.0)
+        )
+
+    def forward(self, x, gso=None, return_spikes=False):
+        """
+        Forward pass through the improved SNN.
+        
+        Args:
+            x: Input tensor [batch, agents, channels, height, width] or flattened
+            gso: Graph structure (not used in this SNN)
+            return_spikes: Whether to return spike statistics
+            
+        Returns:
+            Action probabilities for each agent
+        """
         # Reset all stateful components
-        if hasattr(self.fc_snn_input_projection, 'reset') and callable(self.fc_snn_input_projection.reset):
-            self.fc_snn_input_projection.reset() # If it were a stateful layer like another SNN block
-        self.snn_block.reset()
-        self.out_neuron.reset()
+        self.reset()
+        
+        # Handle input reshaping
+        if x.dim() == 5:
+            batch, agents, c, h, w = x.size()
+            x = x.reshape(batch * agents, c * h * w)
+        
+        # Input preprocessing and normalization
+        x_norm = self.input_norm(x)  # Normalize for stable training
+        projected = self.input_projection(x_norm)
+        
+        # Scale input to encourage spiking - use config value
+        projected = projected * self.input_scale
+        
+        # Process through main SNN block (with attention and temporal context)
+        snn_output = self.snn_block(projected)
+        
+        # Apply output attention for action selection focus
+        attended_output = self.output_attention(snn_output)
+        
+        # Generate action logits
+        action_logits = self.output_fc(attended_output)
+        
+        # Final spiking output (rate-coded action values)
+        output_spikes = self.output_neuron(action_logits * 3.0)  # Aggressive scaling for output spikes
+        
+        # Ensure output shape is correct
+        if output_spikes.dim() != 2 or output_spikes.shape[-1] != self.num_classes:
+            raise ValueError(f"Unexpected output shape: {output_spikes.shape}")
+        
+        if return_spikes:
+            # Return spike statistics for STDP learning
+            return output_spikes, {
+                'snn_block_spikes': snn_output,
+                'output_spikes': output_spikes,
+                'input_current': projected
+            }
+        
+        return output_spikes
+
+    def reset(self):
+        """Reset all memory modules for clean state between episodes"""
+        super().reset()
+        
+    def get_attention_weights(self, x):
+        """
+        Debug method to visualize attention weights.
+        Useful for understanding what the network focuses on.
+        """
+        if x.dim() == 5:
+            batch, agents, c, h, w = x.size()
+            x = x.reshape(batch * agents, c * h * w)
+        
+        x_norm = self.input_norm(x)
+        projected = self.input_projection(x_norm)
+        
+        # Get attention weights from input attention
+        input_attention = torch.sigmoid(self.snn_block.attention.attention_fc(projected))
+        
+        return {
+            'input_attention': input_attention,
+            'projected_features': projected
+        }

@@ -97,7 +97,10 @@ def record_env(path, config):
 
 
 if __name__ == "__main__":
-
-    # total=200
-    pwd_path = f"dataset/5_8_28/test"
-    record_env(pwd_path)
+    from config import config
+    import torch
+    config['device'] = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    # Determine path for recording from config
+    val_conf = config.get('valid', {})
+    path = val_conf.get('root_dir', 'dataset/5_8_28') + '/' + val_conf.get('mode', '')
+    record_env(path, config)

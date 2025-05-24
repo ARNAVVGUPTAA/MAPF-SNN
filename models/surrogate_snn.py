@@ -11,11 +11,9 @@ class RecurrentLIFNode(neuron.BaseNode):
     """
     A recurrent leaky integrate-and-fire (LIF) neuron layer.
     """
-    def __init__(self, tau=2.5, v_reset=0.0, v_threshold=0.1, 
+    def __init__(self, tau=5.0, v_reset=0.0, v_threshold=0.3, 
                  surrogate_function=surrogate.Sigmoid(alpha=4.0), detach_reset=True):
-        super().__init__(surrogate_function=surrogate_function, detach_reset=detach_reset)
-        #self.initialize_weights()
-        # Use global config values or fallbacks
+        # Initialize BaseNode with surrogate gradient and reset behavior
         alpha = config.get('surrogate_alpha', 4.0)
         super().__init__(surrogate_function=surrogate.Sigmoid(alpha=alpha), detach_reset=detach_reset)
         self.tau = config.get('lif_tau', tau) if tau is None else tau
@@ -28,9 +26,9 @@ class RecurrentLIFNode(neuron.BaseNode):
         # Always reset mem if shape does not match x
         if self.mem is None or self.mem.shape != x.shape:
             self.mem = torch.zeros_like(x)
-        # ⚡ Proper exponential decay with input scaling
+        # ⚡ Proper exponential decay with input integration
         decay = math.exp(-1.0 / self.tau)
-        self.mem = self.mem * (1 - 1/self.tau) + x / self.tau
+        self.mem = self.mem * decay + x * (1 - decay)
 
     def neuronal_fire(self):
         # Use hard threshold for spiking
@@ -41,6 +39,12 @@ class RecurrentLIFNode(neuron.BaseNode):
         self.neuronal_charge(x)
         self.spike = self.neuronal_fire()
         self.v = self.mem  # ensure v is tensor before reset
+        
+        # Debug: print membrane stats when log_spikes is True
+        if log_spikes:
+            print(f"  LIF mem min: {self.mem.min().item():.4f}, max: {self.mem.max().item():.4f}, mean: {self.mem.mean().item():.4f}")
+            print(f"  LIF spikes: {self.spike.sum().item():.0f} / {self.spike.numel()}")
+        
         self.neuronal_reset(self.spike)
         return self.spike
 
@@ -50,7 +54,7 @@ class AdaptiveLIFNode(RecurrentLIFNode):
     """
     Extends RecurrentLIFNode by adding an adaptation current that raises threshold after each spike.
     """
-    def __init__(self, tau=2.5, adaptation_tau=100.0, alpha=0.1, v_reset=0.0, v_threshold=0.1,
+    def __init__(self, tau=5.0, adaptation_tau=200.0, alpha=0.01, v_reset=0.0, v_threshold=0.3,
                  surrogate_function=None, detach_reset=True):
         super().__init__(tau, v_reset, v_threshold,
                          surrogate_function or surrogate.Sigmoid(alpha=4.0), detach_reset)
@@ -71,144 +75,125 @@ class AdaptiveLIFNode(RecurrentLIFNode):
         # increment adaptation on spike
         self.b = self.b + self.alpha * self.spike
         self.v = self.mem
+        
+        # Debug: print adaptive membrane stats when log_spikes is True
+        if log_spikes:
+            effective_thresh = self.v_threshold + self.b
+            print(f"  Adaptive LIF mem min: {self.mem.min().item():.4f}, max: {self.mem.max().item():.4f}, mean: {self.mem.mean().item():.4f}")
+            print(f"  Adaptive thresh min: {effective_thresh.min().item():.4f}, max: {effective_thresh.max().item():.4f}, mean: {effective_thresh.mean().item():.4f}")
+            print(f"  Adaptive spikes: {self.spike.sum().item():.0f} / {self.spike.numel()}")
+        
         self.neuronal_reset(self.spike)
         return self.spike
 
 
 class SurrogateSNN(nn.Module):
     """
-    Spiking neural network with surrogate gradients and recurrent LIF neurons.
-    Designed for classification tasks with configurable time steps and neuron dynamics.
+    Simplified Spiking Neural Network with fully connected layers.
+    Focuses on core SNN functionality for better learning convergence.
     """
     def __init__(self, input_shape, num_classes, config=None):
         super().__init__()
         C, H, W = input_shape
+        input_size = C * H * W  # Flatten spatial dimensions
         cfg = config or {}
 
-        # Split conv layers into blocks for feedback
-        self.conv1 = nn.Sequential(
-            layer.Conv2d(C, 64, kernel_size=7, stride=1, padding=2),
+        # Simplified SNN architecture with fewer layers
+        # Layer 1: Input to hidden layer 1
+        self.fc1 = nn.Sequential(
+            nn.Flatten(),
+            layer.Linear(input_size, 256),  # Reduced from 512
             RecurrentLIFNode(
-                tau=cfg['lif_tau'] * cfg.get('lif_scale_conv1', 1.0)
+                tau=cfg.get('lif_tau', 10.0),
+                v_threshold=cfg.get('lif_v_threshold', 0.5),
+                v_reset=cfg.get('lif_v_reset', 0.0)
             ),
-             # Synapse filter with fixed time constant (non-learnable)
-            SynapseFilter(tau=cfg['syn_tau'], learnable=False),
         )
-        self.conv2 = nn.Sequential(
-            layer.Conv2d(64, 128, kernel_size=5, padding=1),
+        
+        # Layer 2: Hidden layer 1 to hidden layer 2
+        self.fc2 = nn.Sequential(
+            layer.Linear(256, 128),  # Reduced from 256
             AdaptiveLIFNode(
-                tau=cfg['lif_tau'] * cfg.get('lif_scale_conv2', 0.75),
-                adaptation_tau=cfg['adapt_tau'],
-                alpha=cfg['adapt_alpha']
+                tau=cfg.get('lif_tau', 10.0),
+                adaptation_tau=cfg.get('adapt_tau', 100.0),
+                alpha=cfg.get('adapt_alpha', 0.02),
+                v_threshold=cfg.get('lif_v_threshold', 0.5),
+                v_reset=cfg.get('lif_v_reset', 0.0)
             ),
         )
-        self.conv3 = nn.Sequential(
-            layer.Conv2d(128, 256, kernel_size=3, stride=2, padding=1),
+        
+        # Layer 3: Hidden layer 2 to output layer (simplified)
+        self.fc3 = nn.Sequential(
+            layer.Linear(128, 64),  # Reduced from 128
             RecurrentLIFNode(
-                tau=cfg['lif_tau'] * cfg.get('lif_scale_conv3', 0.6)
+                tau=cfg.get('lif_tau', 10.0),
+                v_threshold=cfg.get('lif_v_threshold', 0.5),
+                v_reset=cfg.get('lif_v_reset', 0.0)
             )
         )
-        # ⚡ Recurrent feedback from conv2 to conv1 via 1x1 conv + LIF
-        self.feedback = nn.Sequential(
-            RecurrentLIFNode(tau=cfg.get('lif_tau', 2.0)*0.5),
-            layer.Conv2d(128, 64, kernel_size=1)
-        )
 
-        # ⚡ Single-step attention mechanism
-        self.attention = LinearRecurrentContainer(
-            RecurrentLIFNode(
-                tau=cfg['lif_tau'] * cfg.get('lif_scale_attention', 0.5)
-            ),
-             step_mode='s',  # single-step mode for 2D inputs
-            in_features=256,
-            out_features=256,
-             bias=True
-         )        
-        # Additional conv4 block integrating post-attention features
-        self.conv4 = nn.Sequential(
-            layer.Conv2d(256, 128, kernel_size=5, padding=2),
-            AdaptiveLIFNode(
-                tau=cfg['lif_tau'] * cfg.get('lif_scale_conv4', 0.75),
-                adaptation_tau=cfg['adapt_tau'],
-                alpha=cfg['adapt_alpha']
-            ),
-        )
+        # Classification head with no additional spiking
+        self.classifier = layer.Linear(64, num_classes)
 
-        # classification head now expects 128 features from conv4
-        self.classifier = nn.Sequential(
-            nn.AdaptiveAvgPool2d((1, 1)),
-            nn.Flatten(),
-            layer.Linear(128, num_classes)
-        )
-
-        self.num_classes = num_classes  # Save num_classes for reshaping outputs
-
-        # residual projection from conv2 to conv3
-        self.res_conv = nn.Conv2d(128, 256, kernel_size=1)
-        # transformer-based spatial self-attention
-        self.transformer = nn.TransformerEncoder(
-            nn.TransformerEncoderLayer(
-                d_model=256,
-                nhead=cfg['transformer_nhead'],
-                dim_feedforward=cfg['transformer_ff_dim']
-            ),
-            num_layers=cfg['transformer_layers']
-        )
-        # Second transformer encoder for deeper context
-        self.transformer2 = nn.TransformerEncoder(
-            nn.TransformerEncoderLayer(
-                d_model=256,
-                nhead=cfg['transformer_nhead'],
-                dim_feedforward=cfg['transformer_ff_dim']
-            ),
-            num_layers=cfg['transformer2_layers']
-        )
+        self.num_classes = num_classes
+        self._initialize_weights()
 
     def _initialize_weights(self):
         for m in self.modules():
-            if isinstance(m, (nn.Conv2d, nn.Linear)):
-                nn.init.kaiming_normal_(m.weight, mode='fan_out')
+            if isinstance(m, layer.Linear):
+                # Xavier initialization for better convergence
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
 
     def forward(self, x, log_spikes=False):
-        """
-        Process single time step with shape [B, A, C, H, W]
-        Maintains internal state between calls until reset
-        """
-        # ⚡ Handle agent dimension
+        # Debug: print input stats
+        if log_spikes:
+            print(f"Input min: {x.min().item():.4f}, max: {x.max().item():.4f}, mean: {x.mean().item():.4f}")
+        
+        # Input preprocessing to encourage spiking
+        # Normalize inputs to reasonable range, then scale
+        x = (x - x.mean()) / (x.std() + 1e-8)  # Normalize to mean=0, std=1
+        input_scale = 3.0  # Higher scale to reach firing threshold
+        x = x * input_scale
+        
+        if log_spikes:
+            print(f"Normalized input min: {x.min().item():.4f}, max: {x.max().item():.4f}, mean: {x.mean().item():.4f}")
+        
+        # Handle agent dimension
         if x.dim() == 5:
             B, A, C, H, W = x.shape
             x = x.reshape(B*A, C, H, W)
         
-        # Feature extraction with feedback
-        x1 = self.conv1(x)
-        x2 = self.conv2(x1)
-        # compute spatial feedback from conv2 and add to x1
-        fb = self.feedback(x2)  # [batch,64,H,W]
-        x1 = x1 + fb
-        x2 = self.conv2(x1)
-        # conv3 with residual skip and self-attention
-        skip = self.res_conv(x2)
-        x3 = self.conv3(x2) + skip
-        # apply transformer over spatial positions
-        Bz, C, H3, W3 = x3.shape
-        seq = x3.view(Bz, C, H3*W3).permute(2, 0, 1)
-        attn = self.transformer(seq)
-        attn = attn.permute(1, 2, 0).view(Bz, C, H3, W3)
-        out = x3 + attn
-
-        # Second attention block before conv4
-        seq2 = out.view(Bz, C, H3*W3).permute(2, 0, 1)
-        attn2 = self.transformer2(seq2)
-        attn2 = attn2.permute(1, 2, 0).view(Bz, C, H3, W3)
-        out = out + attn2
-
-        # Attention with recurrence
-        att = self.attention(
-            F.adaptive_avg_pool2d(out, (1, 1)).flatten(1)
-        )
-        att = att.view(out.shape[0], 256, 1, 1)
-        out = out * att.sigmoid()
-        # further process through conv4
-        out = self.conv4(out)
-        # Classification
-        return self.classifier(out)
+        # Simplified forward pass with spike amplification
+        if log_spikes:
+            print("FC1 forward...")
+        x1 = self.fc1(x)
+        if log_spikes:
+            print(f"FC1 spikes: {x1.sum().item():.0f} / {x1.numel()}")
+        
+        # Amplify spikes for better propagation
+        x1_amplified = x1 * 2.0  # Boost signal strength
+        
+        if log_spikes:
+            print("FC2 forward...")
+        x2 = self.fc2(x1_amplified)
+        if log_spikes:
+            print(f"FC2 spikes: {x2.sum().item():.0f} / {x2.numel()}")
+        
+        # Amplify again for FC3
+        x2_amplified = x2 * 2.0
+        
+        if log_spikes:
+            print("FC3 forward...")
+        x3 = self.fc3(x2_amplified)
+        if log_spikes:
+            print(f"FC3 spikes: {x3.sum().item():.0f} / {x3.numel()}")
+        
+        # Classification (no spiking in final layer)
+        output = self.classifier(x3)
+        
+        if log_spikes:
+            print(f"Output min: {output.min().item():.4f}, max: {output.max().item():.4f}")
+        
+        return output

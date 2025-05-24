@@ -2,33 +2,30 @@ from dataset_gen import create_solutions
 from trayectory_parser import parse_traject
 from record import record_env
 
-import argparse, yaml
+from config import config
+import torch
 
-parser = argparse.ArgumentParser()
-parser.add_argument('--config', type=str, default="configs/config_snn.yaml")
-args = parser.parse_args()
-
-with open(args.config, "r") as config_path:
-    config = yaml.safe_load(config_path)
+config['device'] = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
 
 if __name__ == "__main__":
-    cases_train = 1000
-    cases_val = 200
+    cases_train = config.get("cases_train", 1000)
+    cases_val = config.get("cases_val", 200)
 
-    config_train = {
-        "num_agents": config["num_agents"],
-        "map_shape": config["map_shape"],
+    config_train = config.copy()
+    config_train.update({
+        "path": config.get("train_root_dir", "dataset/5_8_28/train"),
         "nb_agents": config["num_agents"],
-        "nb_obstacles": config["obstacles"],
-        "sensor_range": config["sensing_range"],
-        "board_size": config["board_size"],
-        "max_time": config["max_time"],
-        "min_time": config["min_time"],
-        "path": "dataset/5_8_28/train",
-    }
-    config_val = config_train.copy()
-    config_val["path"] = "dataset/5_8_28/val"
+        "nb_obstacles": config.get("obstacles", 0),
+        "sensor_range": config.get("sensing_range"),
+    })
+    config_val = config.copy()
+    config_val.update({
+        "path": config.get("valid_root_dir", "dataset/5_8_28/val"),
+        "nb_agents": config["num_agents"],
+        "nb_obstacles": config.get("obstacles", 0),
+        "sensor_range": config.get("sensing_range"),
+    })
 
     # Generate training data
     create_solutions(config_train["path"], cases_train, config_train)
