@@ -16,9 +16,16 @@ from grid.env_graph_gridv1 import GraphEnv, create_goals, create_obstacles
 from data_loader import GNNDataLoader, SNNDataLoader
 
 from spikingjelly.activation_based import learning, functional
-
+from spikingjelly.activation_based.neuron import LIFNode
 from config import config
 from models.surrogate_snn import SurrogateSNN, RecurrentLIFNode
+from collision_utils import (
+    compute_collision_loss, 
+    extract_positions_from_fov, 
+    predict_future_collisions,
+    reconstruct_positions_from_trajectories,
+    load_initial_positions_from_dataset
+)
 
 def compute_success_rate(success_list):
     """
@@ -113,23 +120,69 @@ if __name__ == "__main__":
         if net_type == "snn":
             train_loss = 0.0
             total_spikes = 0  # Initialize total spikes counter
+            
+            # Load initial positions for collision detection if enabled
+            use_collision_loss = config.get('use_collision_loss', True)
+            initial_positions_cache = {}
+            
             for i, (states, trajectories, _) in enumerate(data_loader.train_loader):
                 states = states.to(device)
-                trajectories = trajectories.to(device)  # [batch, agents]
+                trajectories = trajectories.to(device)  # [batch, time, agents]
 
                 T = states.shape[1]  # Number of time steps
+                batch_size = states.shape[0]
+                num_agents = trajectories.shape[2]
+
+                # Load initial positions for this batch if collision loss is enabled
+                if use_collision_loss:
+                    try:
+                        # Get case indices for this batch (simplified approach)
+                        batch_start_idx = i * batch_size
+                        case_indices = list(range(batch_start_idx, batch_start_idx + batch_size))
+                        
+                        # Load initial positions from dataset
+                        initial_positions = load_initial_positions_from_dataset(
+                            config['train']['root_dir'], case_indices, mode='train'
+                        )
+                        initial_positions = initial_positions.to(device)
+                        
+                        # Handle batch size mismatch if needed
+                        if initial_positions.shape[0] > batch_size:
+                            initial_positions = initial_positions[:batch_size]
+                        elif initial_positions.shape[0] < batch_size:
+                            # Pad with dummy positions if needed
+                            dummy_positions = torch.randint(0, 28, (batch_size - initial_positions.shape[0], num_agents, 2), 
+                                                           device=device, dtype=torch.float32)
+                            initial_positions = torch.cat([initial_positions, dummy_positions], dim=0)
+                            
+                    except Exception as e:
+                        print(f"Warning: Failed to load initial positions: {e}. Using dummy positions.")
+                        initial_positions = torch.randint(0, 28, (batch_size, num_agents, 2), 
+                                                         device=device, dtype=torch.float32)
 
                 # Reset and forward through time
                 functional.reset_net(model)
                 spike_reg = 0.0  # initialize spike regularization accumulator
+                collision_reg = 0.0  # initialize collision regularization accumulator
                 total_loss = 0.0
                 total_spikes = 0
+                total_collisions = 0
+                
+                # Get collision loss configuration
+                collision_config = {
+                    'vertex_collision_weight': config.get('vertex_collision_weight', 1.0),
+                    'edge_collision_weight': config.get('edge_collision_weight', 0.5),
+                    'collision_loss_type': config.get('collision_loss_type', 'l2')
+                }
+                collision_loss_weight = config.get('collision_loss_weight', 2.0)
+                
+                prev_positions = None
                 for t in range(T):
                     fov_t = states[:, t]
-                    out_t = model(fov_t)
+                    out_t, spike_info = model(fov_t, return_spikes=True)
                     out_t = out_t.view(-1, trajectories.shape[2], model.num_classes)
 
-                    # compute loss for time step
+                    # compute standard cross-entropy loss for time step
                     loss = 0
                     for agent in range(trajectories.shape[2]):
                         logits = out_t[:, agent]
@@ -137,21 +190,50 @@ if __name__ == "__main__":
                         loss += F.cross_entropy(logits, targets)
                     loss /= trajectories.shape[2]
 
-                    # accumulate spike regularization and count spikes
-                    for m in model.modules():
-                        if isinstance(m, RecurrentLIFNode) and m.spike is not None:
-                            spike_reg += m.spike.mean().item()
-                            total_spikes += m.spike.sum().item()
+                    # Add collision loss if enabled
+                    if use_collision_loss:
+                        # Reconstruct current positions from trajectories
+                        current_positions = reconstruct_positions_from_trajectories(
+                            initial_positions, trajectories, current_time=t, 
+                            board_size=config['board_size'][0]
+                        )
+                        
+                        # Compute collision loss based on predicted actions
+                        logits_flat = out_t.view(-1, model.num_classes)
+                        collision_loss, collision_info = compute_collision_loss(
+                            logits_flat, current_positions, prev_positions, collision_config
+                        )
+                        
+                        # Add collision loss to total loss
+                        loss += collision_loss_weight * collision_loss
+                        collision_reg += float(collision_loss.item())
+                        total_collisions += collision_info['total_collisions']
+                        
+                        # Update previous positions for next timestep
+                        prev_positions = current_positions
+
+                    spike_reg    += float(spike_info['output_spikes'].mean().item())
+                    total_spikes += int(  spike_info['output_spikes'].sum().item())
 
                     total_loss += loss
                     functional.detach_net(model)
+                    #out_t, spike_info = model(fov_t, return_spikes=True)
+                    # print(
+                    #     f"[Epoch {epoch} Step {t}] "
+                    #     f"Input μ/σ: {spike_info['input_current'].mean():.3f}/"
+                    #     f"{spike_info['input_current'].std():.3f} | "
+                    #     f"Block spikes avg: {spike_info['snn_block_spikes'].mean():.3f} | "
+                    #     f"Final spikes sum: {spike_info['output_spikes'].sum():.0f}"
+                    # )
 
                 # average over time
                 total_loss /= T
                 spike_reg /= T  # average regularization over time
+                collision_reg /= T  # average collision regularization over time
+                
                 # include L1 spike regularization in loss
-          
-                total_loss += 0.5 * spike_reg
+                spike_decay = max(0.03, 0.1 * (1 - epoch / 100))
+                total_loss += spike_decay * spike_reg
 
                 # Backpropagation and optimization
                 optimizer.zero_grad()
@@ -160,7 +242,7 @@ if __name__ == "__main__":
                 optimizer.step()
 
                 train_loss += total_loss.item()
-            print(f"Epoch {epoch} | Loss: {total_loss:.4f} | Spikes: {total_spikes} | SpikeReg: {spike_reg:.4f}")
+            print(f"Epoch {epoch} | Loss: {total_loss:.4f} | Spikes: {total_spikes} | SpikeReg: {spike_reg:.4f} | CollisionReg: {collision_reg:.4f} | Collisions: {total_collisions}")
         else:
             train_loss = 0.0
             for i, (states, trajectories, gso) in enumerate(data_loader.train_loader):
