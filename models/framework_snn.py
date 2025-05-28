@@ -54,6 +54,7 @@ class DynamicGraphSNN(base.MemoryModule):
     - Proximity-based agent communication
     - Temporal adaptation of graph structure
     - Enhanced conflict detection with spatial awareness
+    - Batch normalization between spiking layers for stable training
     """
     def __init__(self, input_size, hidden_size, num_agents=5, cfg=None):
         super().__init__()
@@ -63,6 +64,10 @@ class DynamicGraphSNN(base.MemoryModule):
         self.input_scale = config.get('input_scale', 2.0)
         self.num_agents = num_agents
         self.hidden_size = hidden_size
+        
+        # Batch normalization parameters
+        bn_momentum = float(cfg.get('batch_norm_momentum', 0.1)) if cfg else 0.1
+        bn_eps = float(cfg.get('batch_norm_eps', 1e-5)) if cfg else 1e-5
         
         # Dynamic graph parameters
         self.proximity_threshold = config.get('proximity_threshold', 0.3)  # Threshold for agent proximity
@@ -80,22 +85,23 @@ class DynamicGraphSNN(base.MemoryModule):
         # Input processing with enhanced spatial attention
         self.spatial_attention = AttentionGate(input_size)
         self.input_fc = nn.Linear(input_size, hidden_size)
+        self.input_bn = nn.BatchNorm1d(hidden_size, momentum=bn_momentum, eps=bn_eps)
         
         # Position encoding for spatial awareness (helps with proximity calculation)
         self.position_encoder = nn.Linear(2, hidden_size // 4)  # Encode x,y positions
         
         # Dynamic graph structure learning
-        self.edge_weight_predictor = nn.Sequential(
-            nn.Linear(hidden_size * 2, hidden_size),
-            nn.ReLU(),
-            nn.Linear(hidden_size, 1),
-            nn.Sigmoid()  # Output edge weights between 0 and 1
-        )
+        self.edge_weight_fc1 = nn.Linear(hidden_size * 2, hidden_size)
+        self.edge_weight_bn = nn.BatchNorm1d(hidden_size, momentum=bn_momentum, eps=bn_eps)
+        self.edge_weight_fc2 = nn.Linear(hidden_size, 1)
         
         # Enhanced graph-based communication layers
         self.agent_comm_fc = nn.Linear(hidden_size, hidden_size)
+        self.agent_comm_bn = nn.BatchNorm1d(hidden_size, momentum=bn_momentum, eps=bn_eps)
         self.message_agg_fc = nn.Linear(hidden_size, hidden_size)
+        self.message_agg_bn = nn.BatchNorm1d(hidden_size, momentum=bn_momentum, eps=bn_eps)
         self.edge_update_fc = nn.Linear(hidden_size * 2, hidden_size)  # For updating edge representations
+        self.edge_update_bn = nn.BatchNorm1d(hidden_size, momentum=bn_momentum, eps=bn_eps)
         
         # Proximity-aware local decision making
         self.local_decision_lif = AdaptiveLIFNode(
@@ -113,6 +119,7 @@ class DynamicGraphSNN(base.MemoryModule):
         
         # Spatial conflict detection - considers agent positions
         self.spatial_conflict_detector = nn.Linear(hidden_size * 3, hidden_size)  # Include position info
+        self.spatial_conflict_bn = nn.BatchNorm1d(hidden_size, momentum=bn_momentum, eps=bn_eps)
         self.conflict_lif = AdaptiveLIFNode(
             tau=config.get('lif_tau', 10.0) * 0.5,
             v_threshold=config.get('lif_v_threshold', 0.5) * 0.6,
@@ -121,6 +128,7 @@ class DynamicGraphSNN(base.MemoryModule):
         
         # Temporal memory with graph adaptation
         self.recurrent_fc = nn.Linear(hidden_size, hidden_size)
+        self.recurrent_bn = nn.BatchNorm1d(hidden_size, momentum=bn_momentum, eps=bn_eps)
         self.temporal_lif = AdaptiveLIFNode(
             tau=config.get('lif_tau', 10.0) * 1.2,
             v_threshold=config.get('lif_v_threshold', 0.5),
@@ -128,7 +136,14 @@ class DynamicGraphSNN(base.MemoryModule):
         )
         
         # Output processing
-        self.output_fc = nn.Linear(hidden_size, hidden_size)
+        self.output_fc = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size),
+            nn.Dropout(p=0.2),
+            nn.ReLU(),
+            nn.Linear(hidden_size, hidden_size)
+        )
+
+        self.output_bn = nn.BatchNorm1d(hidden_size, momentum=bn_momentum, eps=bn_eps)
         
         # Learnable edge weights (will be updated dynamically)
         self.register_buffer('edge_weights', torch.ones(num_agents, num_agents) * 0.5)
@@ -181,8 +196,25 @@ class DynamicGraphSNN(base.MemoryModule):
         
         if edge_features:
             edge_features = torch.stack(edge_features, dim=1)  # [batch, num_pairs, hidden*2]
-            predicted_weights = self.edge_weight_predictor(edge_features)  # [batch, num_pairs, 1]
-            predicted_weights = predicted_weights.squeeze(-1)  # [batch, num_pairs]
+            
+            # Reshape for batch norm: [batch * num_pairs, hidden*2] -> [batch * num_pairs, hidden] -> [batch, num_pairs, hidden]
+            batch_size, num_pairs, feature_dim = edge_features.shape
+            edge_features_flat = edge_features.view(-1, feature_dim)  # [batch*num_pairs, hidden*2]
+            
+            # Apply first linear layer
+            edge_hidden = self.edge_weight_fc1(edge_features_flat)  # [batch*num_pairs, hidden]
+            
+            # Apply batch normalization
+            edge_hidden = self.edge_weight_bn(edge_hidden)  # [batch*num_pairs, hidden]
+            
+            # Apply ReLU activation
+            edge_hidden = torch.relu(edge_hidden)
+            
+            # Apply second linear layer and sigmoid
+            edge_weights_flat = torch.sigmoid(self.edge_weight_fc2(edge_hidden))  # [batch*num_pairs, 1]
+            
+            # Reshape back to original dimensions
+            predicted_weights = edge_weights_flat.view(batch_size, num_pairs)  # [batch, num_pairs]
             
             # Reshape back to adjacency matrix format
             edge_weights = torch.zeros(batch_size, self.num_agents, self.num_agents, device=device)
@@ -234,8 +266,10 @@ class DynamicGraphSNN(base.MemoryModule):
         """
         batch_size = agent_features.size(0)
         
-        # Generate messages from each agent
-        messages = self.agent_comm_fc(agent_features)  # [batch, num_agents, hidden_size]
+        # Generate messages from each agent with batch norm
+        messages = self.agent_comm_fc(agent_features.view(-1, self.hidden_size))
+        messages = self.agent_comm_bn(messages)  # Apply batch norm
+        messages = messages.view(batch_size, self.num_agents, self.hidden_size)
         
         # Weight messages by learned edge importance
         weighted_adj = adj_matrix * edge_weights
@@ -243,8 +277,10 @@ class DynamicGraphSNN(base.MemoryModule):
         # Aggregate messages based on weighted graph structure
         aggregated_messages = torch.bmm(weighted_adj, messages)  # [batch, num_agents, hidden_size]
         
-        # Process aggregated messages
-        processed_messages = self.message_agg_fc(aggregated_messages)
+        # Process aggregated messages with batch norm
+        processed_messages = self.message_agg_fc(aggregated_messages.view(-1, self.hidden_size))
+        processed_messages = self.message_agg_bn(processed_messages)  # Apply batch norm
+        processed_messages = processed_messages.view(batch_size, self.num_agents, self.hidden_size)
         
         return processed_messages
         
@@ -263,8 +299,10 @@ class DynamicGraphSNN(base.MemoryModule):
         # Concatenate current, neighbor, and spatial features for enhanced conflict detection
         conflict_input = torch.cat([current_features, neighbor_features, position_info], dim=-1)
         
-        # Detect conflicts through learned spatial patterns
-        conflict_potential = self.spatial_conflict_detector(conflict_input)
+        # Detect conflicts through learned spatial patterns with batch norm
+        conflict_potential = self.spatial_conflict_detector(conflict_input.view(-1, self.hidden_size * 3))
+        conflict_potential = self.spatial_conflict_bn(conflict_potential)  # Apply batch norm
+        conflict_potential = conflict_potential.view(current_features.shape)
         
         # Generate conflict signals through spiking
         conflict_signals = self.conflict_lif(conflict_potential * self.input_scale)
@@ -293,8 +331,10 @@ class DynamicGraphSNN(base.MemoryModule):
         # Apply spatial attention to input
         attended_x = self.spatial_attention(x)
         
-        # Project to hidden space and scale for spiking
-        input_current = self.input_fc(attended_x) * self.input_scale
+        # Project to hidden space and scale for spiking with batch norm
+        input_current = self.input_fc(attended_x)
+        input_current = self.input_bn(input_current)  # Apply batch norm
+        input_current = input_current * self.input_scale
         
         # Reshape for agent-based processing
         agent_features = input_current.view(batch_size, self.num_agents, self.hidden_size)
@@ -338,7 +378,9 @@ class DynamicGraphSNN(base.MemoryModule):
                 # Subsequent time steps: input + communication + recurrence
                 recurrent_current = self.recurrent_fc(
                     hidden_state.view(-1, self.hidden_size)
-                ).view(batch_size, self.num_agents, self.hidden_size)
+                )
+                recurrent_current = self.recurrent_bn(recurrent_current)  # Apply batch norm
+                recurrent_current = recurrent_current.view(batch_size, self.num_agents, self.hidden_size)
                 
                 total_current = (agent_features * self.input_weight + 
                                comm_messages * 0.3 + 
@@ -374,8 +416,9 @@ class DynamicGraphSNN(base.MemoryModule):
         # Reshape back to original format
         output_features = avg_spikes.view(-1, self.hidden_size)
         
-        # Final output processing
+        # Final output processing with batch norm
         output = self.output_fc(output_features)
+        output = self.output_bn(output)  # Apply batch norm
         
         return output
 
@@ -590,7 +633,7 @@ class Network(base.MemoryModule):
         action_logits = self.output_fc(attended_output)
         
         # 6. Final spiking output (rate-coded action values)
-        output_spikes = self.output_neuron(action_logits * 3.0)  # Aggressive scaling for output spikes
+        output_spikes = self.output_neuron(action_logits * 2.0)  # Aggressive scaling for output spikes
         
         # Ensure output shape is correct
         if output_spikes.dim() != 2 or output_spikes.shape[-1] != self.num_classes:
@@ -659,6 +702,10 @@ class SpikingTransformer(base.MemoryModule):
         self.head_dim = d_model // nhead
         dim_feedforward = dim_feedforward or d_model * 2
         
+        # Batch normalization parameters - get from config if available
+        bn_momentum = float(config.get('batch_norm_momentum', 0.1))
+        bn_eps = float(config.get('batch_norm_eps', 1e-5))
+        
         # Ensure d_model is divisible by nhead
         assert d_model % nhead == 0, f"d_model {d_model} must be divisible by nhead {nhead}"
         
@@ -669,6 +716,7 @@ class SpikingTransformer(base.MemoryModule):
         
         # Output projection
         self.out_proj = nn.Linear(d_model, d_model)
+        self.out_proj_bn = nn.BatchNorm1d(d_model, momentum=bn_momentum, eps=bn_eps)
         
         # Spiking neurons for attention processing
         self.attn_lif = AdaptiveLIFNode(
@@ -677,15 +725,17 @@ class SpikingTransformer(base.MemoryModule):
             v_reset=config.get('lif_v_reset', 0.0)
         )
         
-        # Feedforward network with spiking
+        # Feedforward network with spiking and batch norm
         self.ff_network = nn.Sequential(
             nn.Linear(d_model, dim_feedforward),
+            nn.BatchNorm1d(dim_feedforward, momentum=bn_momentum, eps=bn_eps),
             AdaptiveLIFNode(
                 tau=config.get('lif_tau', 10.0),
                 v_threshold=config.get('lif_v_threshold', 0.5),
                 v_reset=config.get('lif_v_reset', 0.0)
             ),
             nn.Linear(dim_feedforward, d_model),
+            nn.BatchNorm1d(d_model, momentum=bn_momentum, eps=bn_eps)
         )
         
         # Layer normalization
@@ -729,7 +779,9 @@ class SpikingTransformer(base.MemoryModule):
         
         # Reshape and project: [batch, seq_len, d_model]
         attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, d_model)
-        attn_output = self.out_proj(attn_output)
+        attn_output = self.out_proj(attn_output.view(-1, d_model))
+        attn_output = self.out_proj_bn(attn_output)  # Apply batch norm
+        attn_output = attn_output.view(batch_size, seq_len, d_model)
         
         # Pass through spiking neuron and add residual
         spiking_attn = self.attn_lif(attn_output * config.get('input_scale', 2.0))
@@ -737,7 +789,8 @@ class SpikingTransformer(base.MemoryModule):
         
         # Feedforward with residual connection
         ff_input = self.norm2(x)
-        ff_output = self.ff_network(ff_input * config.get('input_scale', 2.0))
+        ff_output = self.ff_network(ff_input.view(-1, d_model) * config.get('input_scale', 2.0))
+        ff_output = ff_output.view(batch_size, seq_len, d_model)
         x = x + ff_output
         
         # Return to original shape if needed

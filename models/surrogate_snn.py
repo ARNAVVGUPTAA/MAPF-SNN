@@ -89,7 +89,7 @@ class AdaptiveLIFNode(RecurrentLIFNode):
 
 class SurrogateSNN(nn.Module):
     """
-    Simplified Spiking Neural Network with fully connected layers.
+    Simplified Spiking Neural Network with fully connected layers and batch normalization.
     Focuses on core SNN functionality for better learning convergence.
     """
     def __init__(self, input_shape, num_classes, config=None):
@@ -98,33 +98,40 @@ class SurrogateSNN(nn.Module):
         input_size = C * H * W  # Flatten spatial dimensions
         cfg = config or {}
 
-        # Simplified SNN architecture with fewer layers
-        # Layer 1: Input to hidden layer 1
+        # Batch normalization parameters
+        bn_momentum = float(cfg.get('batch_norm_momentum', 0.1))
+        bn_eps = float(cfg.get('batch_norm_eps', 1e-5))
+        self.use_batch_norm = True  # Always use batch norm as requested
+
+        # Layer 1: Input to hidden layer 1 with batch norm
         self.fc1 = nn.Sequential(
             nn.Flatten(),
-            layer.Linear(input_size, 256),  # Reduced from 512
+            layer.Linear(input_size, 256),
+            nn.BatchNorm1d(256, momentum=bn_momentum, eps=bn_eps),
             RecurrentLIFNode(
                 tau=cfg.get('lif_tau', 10.0),
                 v_threshold=cfg.get('lif_v_threshold', 0.5),
                 v_reset=cfg.get('lif_v_reset', 0.0)
-            ),
+            )
         )
         
-        # Layer 2: Hidden layer 1 to hidden layer 2
+        # Layer 2: Hidden layer 1 to hidden layer 2 with batch norm
         self.fc2 = nn.Sequential(
-            layer.Linear(256, 128),  # Reduced from 256
+            layer.Linear(256, 128),
+            nn.BatchNorm1d(128, momentum=bn_momentum, eps=bn_eps),
             AdaptiveLIFNode(
                 tau=cfg.get('lif_tau', 10.0),
                 adaptation_tau=cfg.get('adapt_tau', 100.0),
                 alpha=cfg.get('adapt_alpha', 0.02),
                 v_threshold=cfg.get('lif_v_threshold', 0.5),
                 v_reset=cfg.get('lif_v_reset', 0.0)
-            ),
+            )
         )
         
-        # Layer 3: Hidden layer 2 to output layer (simplified)
+        # Layer 3: Hidden layer 2 to output layer with batch norm
         self.fc3 = nn.Sequential(
-            layer.Linear(128, 64),  # Reduced from 128
+            layer.Linear(128, 64),
+            nn.BatchNorm1d(64, momentum=bn_momentum, eps=bn_eps),
             RecurrentLIFNode(
                 tau=cfg.get('lif_tau', 10.0),
                 v_threshold=cfg.get('lif_v_threshold', 0.5),
@@ -132,8 +139,11 @@ class SurrogateSNN(nn.Module):
             )
         )
 
-        # Classification head with no additional spiking
-        self.classifier = layer.Linear(64, num_classes)
+        # Classification head with batch normalization
+        self.classifier = nn.Sequential(
+            layer.Linear(64, num_classes),
+            nn.BatchNorm1d(num_classes, momentum=bn_momentum, eps=bn_eps)
+        )
 
         self.num_classes = num_classes
         self._initialize_weights()
@@ -145,35 +155,46 @@ class SurrogateSNN(nn.Module):
                 nn.init.xavier_uniform_(m.weight)
                 if m.bias is not None:
                     nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.BatchNorm1d):
+                # Standard batch norm initialization
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
 
     def forward(self, x, log_spikes=False):
         # Debug: print input stats
         if log_spikes:
             print(f"Input min: {x.min().item():.4f}, max: {x.max().item():.4f}, mean: {x.mean().item():.4f}")
         
-        # Input preprocessing to encourage spiking
-        # Normalize inputs to reasonable range, then scale
-        x = (x - x.mean()) / (x.std() + 1e-8)  # Normalize to mean=0, std=1
-        input_scale = 3.0  # Higher scale to reach firing threshold
+        # Input preprocessing - adjust based on whether batch norm is used
+        if self.use_batch_norm:
+            # Light preprocessing since batch norm will handle normalization
+            x = (x - x.mean()) / (x.std() + 1e-8)  # Basic normalization
+            input_scale = 1.5  # Conservative scaling with batch norm
+        else:
+            # More aggressive preprocessing without batch norm
+            x = (x - x.mean()) / (x.std() + 1e-8)  # Normalize to mean=0, std=1
+            input_scale = 3.0  # Higher scale to reach firing threshold
+        
         x = x * input_scale
         
         if log_spikes:
-            print(f"Normalized input min: {x.min().item():.4f}, max: {x.max().item():.4f}, mean: {x.mean().item():.4f}")
+            print(f"Preprocessed input min: {x.min().item():.4f}, max: {x.max().item():.4f}, mean: {x.mean().item():.4f}")
         
         # Handle agent dimension
         if x.dim() == 5:
             B, A, C, H, W = x.shape
             x = x.reshape(B*A, C, H, W)
         
-        # Simplified forward pass with spike amplification
+        # Forward pass - adjust amplification based on batch norm usage
         if log_spikes:
             print("FC1 forward...")
         x1 = self.fc1(x)
         if log_spikes:
             print(f"FC1 spikes: {x1.sum().item():.0f} / {x1.numel()}")
         
-        # Amplify spikes for better propagation
-        x1_amplified = x1 * 2.0  # Boost signal strength
+        # Adjust amplification based on batch norm
+        amplification = 1.2 if self.use_batch_norm else 2.0
+        x1_amplified = x1 * amplification
         
         if log_spikes:
             print("FC2 forward...")
@@ -181,8 +202,8 @@ class SurrogateSNN(nn.Module):
         if log_spikes:
             print(f"FC2 spikes: {x2.sum().item():.0f} / {x2.numel()}")
         
-        # Amplify again for FC3
-        x2_amplified = x2 * 2.0
+        # Apply same amplification for consistency
+        x2_amplified = x2 * amplification
         
         if log_spikes:
             print("FC3 forward...")
@@ -190,7 +211,7 @@ class SurrogateSNN(nn.Module):
         if log_spikes:
             print(f"FC3 spikes: {x3.sum().item():.0f} / {x3.numel()}")
         
-        # Classification (no spiking in final layer)
+        # Classification
         output = self.classifier(x3)
         
         if log_spikes:

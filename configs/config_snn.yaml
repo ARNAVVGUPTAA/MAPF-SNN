@@ -1,134 +1,183 @@
-exp_name: 'trained_models/snn_experiment'  # Use forward slashes (works on all OS)
+# =============================================================================
+# SNN MAPF Configuration File
+# =============================================================================
 
-# RSNN parameters — Add these
-net_type: 'snn'            # ✅ Key change to activate framework_snn.py
-input_dim: 50              # ✅ Assuming 9x9 local FOV per agent (adjust as needed)
-hidden_dim: 128            # Hidden size in SNN layer
-num_actions: 5             # Assuming 5 possible movements (up, down, left, right, stay)
+# Experiment Setup
+exp_name: 'trained_models/snn_experiment'
+net_type: 'snn'
 
-# You can remove or ignore CNN, GNN, encoder, policy MLP params
+# =============================================================================
+# TRAINING PARAMETERS
+# =============================================================================
 
-# Training
+# Basic Training
 epochs: 50
 tests_episodes: 100
-device: cuda               # or 'cpu' if CUDA not available
+device: 'cuda'
 
-# Simulation
-board_size: [28,28]
-map_shape: [9,9]
-num_agents: 5
-obstacles: 5
-max_steps: 32
-max_time: 32
-sensing_range: 6           # Possibly 9x9 input
+# Learning Parameters
+learning_rate: 1e-4      # Adam learning rate
+weight_decay: 1e-5       # L2 regularization weight
+lr_decay_factor: 0.5     # Learning rate decay factor for scheduler
+lr_patience: 10          # Patience for LR scheduler
+early_stop_patience: 25  # Patience for early stopping
+early_stop_threshold: 0.5 # Minimum success rate threshold
 
-# Data Loading
+# Spike Regularization
+spike_reg_weight: 5e-3   # Weight for spike regularization loss
+spike_reg_coef: 5e-4     # Spike regularization coefficient
+max_spike_decay: 5e-5    # Maximum spike decay value
+spike_decay_coeff: 0.05  # Spike decay coefficient
+
+# Cosine Annealing Schedule Parameters
+use_cosine_annealing: true         # Enable cosine annealing for regularizers
+cosine_T_max: 50                   # Period of cosine annealing (typically same as epochs)
+cosine_eta_min_ratio: 0.01         # Minimum value ratio (min_value = eta_min_ratio * initial_value)
+cosine_restart_period: 25          # Period for cosine restart (0 = no restart)
+
+# Expert Training (Teacher-Forcing) Parameters
+use_expert_training: true          # Enable teacher-forcing with expert demonstrations
+max_expert_epochs: 5               # Number of epochs to use expert data (first 5 epochs)
+expert_ratio: 0.25                 # Ratio of expert data to mix in (25% expert, 75% normal)
+
+# Batch Normalization
+batch_norm_momentum: 0.4  # Momentum for batch norm running statistics
+batch_norm_eps: 0.0001   # Epsilon for batch norm numerical stability
+
+# =============================================================================
+# DATA LOADING
+# =============================================================================
+
+# Dataset Configuration
+train:
+  root_dir: 'dataset/5_8_28'
+  mode: 'train'
+  min_time: 5
+  max_time_dl: 25
+  nb_agents: 5
+  batch_size: 128
+
+valid:
+  root_dir: 'dataset/5_8_28'
+  mode: 'valid'
+  min_time: 5
+  max_time_dl: 25
+  nb_agents: 5
+  batch_size: 20  # Reduced from 128 to get more validation batches
+
+# Data Loader Settings
 min_time: 1
 num_workers: 3
 batch_size: 128
-train:
-    root_dir: 'dataset/5_8_28'   # ✅ Use forward slashes for cross-platform compatibility
-    mode: 'train'
-    min_time: 5
-    max_time_dl: 25
-    nb_agents: 5
-    batch_size: 32
-valid:
-    root_dir: 'dataset/5_8_28'
-    mode: 'valid'
-    min_time: 5
-    max_time_dl: 25
-    nb_agents: 5
-    batch_size: 8
 
-# SNN neuron parameters - further optimized for spike propagation
-lif_tau: 6.0           # Shorter time constant for faster response
-lif_v_reset: 0.01       # Reset to zero after spike
-lif_v_threshold: 0.09   # Even lower threshold to ensure spike propagation
+# =============================================================================
+# ENVIRONMENT PARAMETERS
+# =============================================================================
 
-adapt_tau: 200.0       # Longer adaptation for stability
-adapt_alpha: 0.01      # Minimal adaptation to avoid suppressing spikes
+# Simulation Environment
+board_size: [28, 28]
+map_shape: [9, 9]
+num_agents: 5
+obstacles: 5
+max_steps: 40
+max_time: 40
+sensing_range: 6
 
-# SNN temporal and attention parameters for framework_snn
-snn_time_steps: 13      # Number of time steps for temporal context
-tau: 9.0               # Membrane time constant (longer for better integration)
-v_threshold: 0.08      # Lower threshold for reliable spiking
-v_threshold_output: 0.15  # Very low threshold for output neurons
-tau_output: 4.0        # Faster output dynamics
-detach_reset: false     # Detach reset for gradient flow
+# =============================================================================
+# SNN ARCHITECTURE PARAMETERS
+# =============================================================================
 
-# Input scaling - scale to encourage spiking
-input_scale: 7.0       # Scale inputs to help reach firing threshold
+# Model Dimensions
+input_dim: 50
+hidden_dim: 128
+num_actions: 5
 
-# Synapse filter parameters
-syn_tau: 5.0           # Increased synaptic time constant for better integration
+# SNN Neuron Parameters
+lif_tau: 6.0              # LIF neuron time constant
+lif_v_reset: 0.01         # Reset voltage after spike
+lif_v_threshold: 0.09     # Spike threshold voltage
+adapt_tau: 200.0          # Adaptation time constant
+adapt_alpha: 0.01         # Adaptation strength
 
-# Transformer parameters - simplified
-transformer_nhead: 4   # Number of attention heads (must divide embed_dim=128)
-transformer_ff_dim: 128 # Reduced feedforward dimension to match feature size
-transformer_layers: 1  # Simplified to 1 layer for faster learning
-transformer2_layers: 1 # Single layer for second transformer
+# SNN Temporal Parameters
+snn_time_steps: 13        # Number of SNN time steps
+tau: 9.0                  # Membrane time constant
+v_threshold: 0.08         # Spike threshold
+v_threshold_output: 0.15  # Output layer spike threshold
+tau_output: 4.0           # Output layer time constant
+detach_reset: false       # Detach reset for gradient flow
 
-# SNN neuron scaling factors (multipliers on lif_tau) - more uniform
-lif_scale_conv1: 1.0       # Base tau
-lif_scale_conv2: 1.0       # Same tau for consistency
-lif_scale_conv3: 1.0       # Same tau for consistency
-lif_scale_feedback: 1.0    # Same tau for feedback
-lif_scale_attention: 1.0   # Same tau for attention
-lif_scale_conv4: 1.0       # Same tau for output
+# Input Processing
+input_scale: 7.0          # Input scaling factor for spiking
+syn_tau: 5.0              # Synaptic filter time constant
 
-# Surrogate gradient parameters - higher alpha for sharper gradients
-surrogate_alpha: 4.0        # Increased slope for better gradient flow
+# Surrogate Gradient
+surrogate_alpha: 4.0      # Surrogate gradient slope
 
-# SNN-specific parameters
-#snn_time_steps: 7      # Number of time steps for temporal processing
-#tau_output: 5.0        # Output layer neuron time constant  
-#v_threshold_output: 0.1  # Lower threshold for output neurons
-#detach_reset: false    # SpikingJelly parameter
+# SNN Neuron Scaling (multipliers on lif_tau)
+lif_scale_conv1: 1.0
+lif_scale_conv2: 1.0
+lif_scale_conv3: 1.0
+lif_scale_feedback: 1.0
+lif_scale_attention: 1.0
+lif_scale_conv4: 1.0
 
-# Recurrent connection parameters
-recurrence_weight: 0.8 # How much previous hidden state influences current computation (0.0-1.0)
-input_weight: 0.2     # How much current input influences computation (should sum to 1.0 with recurrence_weight)
+# =============================================================================
+# RECURRENT AND GRAPH PARAMETERS
+# =============================================================================
 
-# Graph SNN parameters for localized decision making
-hesitation_weight: 0.2      # How much to inhibit quick decisions when uncertainty is high (0.0-1.0)
-confidence_threshold: 0.7   # Threshold for confident decisions (0.0-1.0)
-communication_weight: 0.3   # Weight for agent-to-agent communication influence
-
-# Training hyperparameters - much lower learning rate for SNNs
-learning_rate: 3e-4     # Reduced from 1e-1 to 1e-3 for stable SNN training
-weight_decay: 2e-5      # Reduced weight decay
-spike_reg_weight: 1e-4 # Much smaller spike regularization
-spike_reg_coef: 1e-3
-
-
-# Learning rate schedule and early stopping
-lr_decay_factor: 0.6         # Gentler LR decay
-lr_patience: 10              # More patience for SNN convergence
-early_stop_patience: 25      # More patience for SNN learning
-early_stop_threshold: 0.5    # Higher threshold (20% success rate)
-
-# Spiking Transformer (Resformer) parameters
-use_spiking_transformer: false    # Enable spiking transformer for better attention
-transformer_nhead: 8              # Number of attention heads
-transformer_ff_dim: 512           # Feedforward dimension in transformer
-
-# Enhanced Architecture Parameters
-use_transformer_encoder: true    # Enable transformer encoder for global spatial understanding
-encoder_nhead: 8                 # Number of attention heads in transformer encoder
-encoder_layers: 2                # Number of transformer encoder layers
-encoder_dropout: 0.1             # Dropout in transformer encoder
+# Recurrent Connections
+recurrence_weight: 0.4    # Previous hidden state influence
+input_weight: 0.6         # Current input influence
 
 # Dynamic Graph Parameters
-proximity_threshold: 0.3         # Threshold for agent proximity-based connections
-max_connections: 3               # Maximum connections per agent in dynamic graph
-edge_learning_rate: 0.1          # Learning rate for edge weight adaptation
+proximity_threshold: 4  # Agent proximity threshold for connections
+max_connections: 5        # Maximum connections per agent
+edge_learning_rate: 0.2   # Edge weight adaptation rate
 
-# Collision Loss Parameters
-use_collision_loss: true         # Enable collision penalty in training
-collision_loss_weight: 2.0       # Weight for collision penalty (higher = more penalty)
-collision_loss_type: 'l2'        # Type of collision loss: 'l1', 'l2', or 'exponential'
-collision_detection_radius: 1  # Radius for detecting collisions (1.0 = adjacent cells)
-vertex_collision_weight: 1.1     # Weight for vertex collisions (same position)
-edge_collision_weight: 1.1       # Weight for edge collisions (agents swapping positions)
-future_collision_steps: 2        # Number of future steps to predict and penalize collisions
+# Graph SNN Decision Making
+hesitation_weight: 0.2     # Decision hesitation factor
+confidence_threshold: 0.7  # Confidence threshold for decisions
+communication_weight: 0.3  # Agent communication influence
+
+# =============================================================================
+# TRANSFORMER PARAMETERS
+# =============================================================================
+
+# Basic Transformer
+transformer_nhead: 4       # Number of attention heads (must divide hidden_dim=128)
+transformer_ff_dim: 128    # Feedforward dimension
+transformer_layers: 1      # Number of transformer layers
+transformer2_layers: 1     # Second transformer layers
+
+# Enhanced Transformer Encoder
+use_transformer_encoder: true
+encoder_nhead: 8           # Encoder attention heads
+encoder_layers: 2          # Encoder layers
+encoder_dropout: 0.1       # Encoder dropout
+
+# Spiking Transformer
+use_spiking_transformer: true
+transformer_nhead: 8       # Spiking transformer heads
+transformer_ff_dim: 512    # Spiking transformer feedforward
+
+# =============================================================================
+# COLLISION LOSS PARAMETERS
+# =============================================================================
+
+# Collision Detection
+use_collision_loss: true
+collision_loss_weight: 15.0    # Weight for collision penalty
+collision_loss_type: 'exponential'     # Loss type: 'l1', 'l2', or 'exponential'
+collision_detection_radius: 1 # Collision detection radius
+
+# Collision Types
+vertex_collision_weight: 3  # Same position collisions
+edge_collision_weight: 3    # Swapping position collisions
+
+# Future Collision Prediction
+use_future_collision_penalty: true
+future_collision_steps: 2      # Steps ahead to predict
+future_collision_weight: 1.4   # Future collision penalty weight
+future_step_decay: 0.7         # Decay for distant future steps
+separate_collision_types: false # Separate real vs future collision handling

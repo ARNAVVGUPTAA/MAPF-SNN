@@ -27,6 +27,15 @@ class MAPFBaseDataset(Dataset):
                os.path.exists(os.path.join(self.dir_path, d, "trajectory_record.npy")) and
                os.path.exists(os.path.join(self.dir_path, d, "gso.npy"))
         ]
+        
+        # Extract case indices for expert trajectory loading
+        self.case_indices = []
+        for case in self.cases:
+            try:
+                case_idx = int(case.split("_")[1])
+                self.case_indices.append(case_idx)
+            except (ValueError, IndexError):
+                self.case_indices.append(-1)  # Invalid case index
         self.states = np.zeros(
             (
                 len(self.cases),
@@ -115,6 +124,7 @@ class MAPFBaseDataset(Dataset):
         self.states = self.states[: self.count]
         self.trajectories = self.trajectories[: self.count]
         self.gsos = self.gsos[: self.count]
+        self.case_indices = self.case_indices[: self.count]  # Trim case indices to match loaded data
         if self.count == 0:
             raise RuntimeError(f"No valid cases loaded from {self.dir_path}. Please check your dataset and config.")
         assert self.states.shape[0] == self.trajectories.shape[0], (
@@ -140,9 +150,10 @@ class CreateSNNDataset(MAPFBaseDataset):
         states = torch.from_numpy(self.states[index]).float()  # (time, agents, 2, 5, 5)
         trayec = torch.from_numpy(self.trajectories[index]).float()  # (time, agents)
         gsos = torch.from_numpy(self.gsos[index]).float()  # (time, agents, agents)
+        case_idx = self.case_indices[index]  # Get case index for expert trajectory
         # Do NOT flatten states for SNN
         # states = states.view(states.shape[0], states.shape[1], -1)  # REMOVE THIS LINE
-        return states, trayec, gsos
+        return states, trayec, gsos, case_idx
 
 
 class CreateGNNDataset(MAPFBaseDataset):

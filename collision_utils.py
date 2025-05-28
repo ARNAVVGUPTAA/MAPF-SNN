@@ -87,45 +87,98 @@ def compute_collision_loss(logits: torch.Tensor,
         collision_config = {
             'vertex_collision_weight': 1.0,
             'edge_collision_weight': 0.5,
-            'collision_loss_type': 'l2'
+            'collision_loss_type': 'l2',
+            'use_future_collision_penalty': False,
+            'future_collision_steps': 2,
+            'future_collision_weight': 0.8,
+            'future_step_decay': 0.7,
+            'separate_collision_types': True  # New flag to handle collisions separately
         }
     
-    # Detect collisions
+    # Detect immediate collisions
     collisions = detect_collisions(positions, prev_positions)
     
     batch_size, num_agents = positions.shape[:2]
     device = positions.device
     
-    # Compute collision penalties
+    # Compute immediate collision penalties
     vertex_penalty = collisions['vertex_collisions'] * collision_config['vertex_collision_weight']
     edge_penalty = collisions['edge_collisions'] * collision_config['edge_collision_weight']
     
-    # Total collision penalty per agent
-    total_penalty = vertex_penalty + edge_penalty  # [batch, num_agents]
+    # Total immediate collision penalty per agent
+    immediate_penalty = vertex_penalty + edge_penalty  # [batch, num_agents]
     
-    # Apply penalty to action probabilities
-    action_probs = torch.softmax(logits.view(batch_size, num_agents, -1), dim=-1)
+    # Initialize collision losses
+    real_collision_loss = torch.tensor(0.0, device=device)
+    future_collision_loss = torch.tensor(0.0, device=device)
     
-    # Collision loss based on configuration
+    # Compute real collision loss
     if collision_config['collision_loss_type'] == 'l1':
-        collision_loss = torch.mean(total_penalty)
+        real_collision_loss = torch.mean(immediate_penalty)
     elif collision_config['collision_loss_type'] == 'l2':
-        collision_loss = torch.mean(total_penalty ** 2)
+        real_collision_loss = torch.mean(immediate_penalty ** 2)
     elif collision_config['collision_loss_type'] == 'exponential':
-        collision_loss = torch.mean(torch.exp(total_penalty) - 1)
+        real_collision_loss = torch.mean(torch.exp(immediate_penalty) - 1)
     else:
-        collision_loss = torch.mean(total_penalty)
+        real_collision_loss = torch.mean(immediate_penalty)
+    
+    # Compute future collision penalty separately (only if no current collision)
+    future_penalty_value = 0.0
+    if collision_config.get('use_future_collision_penalty', False):
+        future_steps = collision_config.get('future_collision_steps', 2)
+        step_decay = collision_config.get('future_step_decay', 0.7)
+        
+        # Only penalize future collisions if there are no current collisions
+        # This prevents double penalization
+        if collision_config.get('separate_collision_types', True):
+            # Create a mask for agents that are NOT currently colliding
+            no_current_collision_mask = (immediate_penalty == 0).float()
+            
+            future_penalty_tensor = predict_future_collisions(
+                positions, logits, 
+                steps=future_steps, 
+                board_size=28,  # TODO: make this configurable
+                step_decay=step_decay,
+                collision_mask=no_current_collision_mask  # Only predict for non-colliding agents
+            )
+        else:
+            # Old behavior: predict for all agents regardless of current collision
+            future_penalty_tensor = predict_future_collisions(
+                positions, logits, 
+                steps=future_steps, 
+                board_size=28,
+                step_decay=step_decay
+            )
+        
+        future_penalty_value = float(future_penalty_tensor.item())
+        future_collision_loss = collision_config.get('future_collision_weight', 0.8) * future_penalty_tensor
+    
+    # Total collision loss - either real OR future, not both
+    if collision_config.get('separate_collision_types', True):
+        # Only add future collision loss if there are no real collisions
+        has_real_collisions = torch.sum(immediate_penalty) > 0
+        if has_real_collisions:
+            total_collision_loss = real_collision_loss
+        else:
+            total_collision_loss = future_collision_loss
+    else:
+        # Old behavior: add both (may lead to double penalization)
+        total_collision_loss = real_collision_loss + future_collision_loss
     
     # Collect collision information for logging
     collision_info = {
-        'total_collisions': torch.sum(total_penalty > 0).item(),
+        'total_real_collisions': torch.sum(immediate_penalty > 0).item(),
         'vertex_collisions': torch.sum(vertex_penalty > 0).item(),
         'edge_collisions': torch.sum(edge_penalty > 0).item(),
-        'collision_rate': torch.mean((total_penalty > 0).float()).item(),
-        'avg_collision_penalty': torch.mean(total_penalty).item()
+        'real_collision_rate': torch.mean((immediate_penalty > 0).float()).item(),
+        'avg_real_collision_penalty': torch.mean(immediate_penalty).item(),
+        'future_collision_penalty': future_penalty_value,
+        'real_collision_loss': float(real_collision_loss.item()),
+        'future_collision_loss': float(future_collision_loss.item()),
+        'using_real_collision_loss': torch.sum(immediate_penalty) > 0 if collision_config.get('separate_collision_types', True) else True
     }
     
-    return collision_loss, collision_info
+    return total_collision_loss, collision_info
 
 
 def extract_positions_from_actions(current_positions: torch.Tensor, 
@@ -168,7 +221,9 @@ def extract_positions_from_actions(current_positions: torch.Tensor,
 def predict_future_collisions(current_positions: torch.Tensor,
                              action_logits: torch.Tensor,
                              steps: int = 2,
-                             board_size: int = 28) -> torch.Tensor:
+                             board_size: int = 28,
+                             step_decay: float = 0.7,
+                             collision_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
     """
     Predict potential collisions in future steps based on current action tendencies.
     
@@ -177,16 +232,19 @@ def predict_future_collisions(current_positions: torch.Tensor,
         action_logits: Action logits [batch * num_agents, num_actions]
         steps: Number of future steps to predict
         board_size: Size of the board
+        step_decay: Decay factor for future steps (closer steps have higher weight)
+        collision_mask: Mask indicating which agents to predict for [batch, num_agents] (1.0 = predict, 0.0 = ignore)
         
     Returns:
         future_collision_penalty: Penalty for predicted future collisions
     """
     batch_size, num_agents = current_positions.shape[:2]
+    device = current_positions.device
     
     # Convert logits to action probabilities
     action_probs = torch.softmax(action_logits.view(batch_size, num_agents, -1), dim=-1)
     
-    total_future_penalty = 0.0
+    total_future_penalty = torch.tensor(0.0, device=device)
     positions = current_positions.clone()
     
     for step in range(steps):
@@ -200,17 +258,33 @@ def predict_future_collisions(current_positions: torch.Tensor,
         # Detect collisions at this future step
         collisions = detect_collisions(next_positions, positions)
         
-        # Add penalty (weighted by distance into future)
-        step_weight = 1.0 / (step + 1)  # Closer steps have higher weight
-        vertex_penalty = torch.sum(collisions['vertex_collisions']) * step_weight
-        edge_penalty = torch.sum(collisions['edge_collisions']) * step_weight * 0.5
+        # Calculate step weight (exponential decay for future steps)
+        step_weight = step_decay ** step
         
-        total_future_penalty += vertex_penalty + edge_penalty
+        # Apply collision mask if provided (only count collisions for non-currently-colliding agents)
+        vertex_penalty = collisions['vertex_collisions']
+        edge_penalty = collisions['edge_collisions']
+        
+        if collision_mask is not None:
+            vertex_penalty = vertex_penalty * collision_mask
+            edge_penalty = edge_penalty * collision_mask
+        
+        # Add penalty (weighted by distance into future)
+        step_penalty = (torch.sum(vertex_penalty) + 0.5 * torch.sum(edge_penalty)) * step_weight
+        total_future_penalty += step_penalty
         
         # Update positions for next iteration
         positions = next_positions
     
-    return total_future_penalty / (batch_size * num_agents * steps)
+    # Normalize by number of agents and steps
+    normalization_factor = batch_size * num_agents * steps
+    if collision_mask is not None:
+        # If using mask, normalize by the number of agents we're actually predicting for
+        active_agents = torch.sum(collision_mask).item()
+        if active_agents > 0:
+            normalization_factor = active_agents * steps
+    
+    return total_future_penalty / normalization_factor if normalization_factor > 0 else total_future_penalty
 
 
 def extract_positions_from_fov(fov: torch.Tensor, num_agents: int, env_positions: torch.Tensor = None) -> torch.Tensor:
