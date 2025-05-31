@@ -189,3 +189,34 @@ def compute_expert_loss_weight(epoch: int, max_expert_epochs: int = 5) -> float:
     
     # Linear decay from 1.0 to 0.0
     return 1.0 - (epoch / max_expert_epochs)
+
+
+def should_apply_expert_training(epoch: int, expert_interval: int = 10) -> bool:
+    """
+    Check if expert training should be applied at the current epoch.
+    Expert training is applied at intervals (epoch 10, 20, 30, 40...).
+    
+    Args:
+        epoch: Current epoch (0-indexed)
+        expert_interval: Interval between expert training epochs
+    
+    Returns:
+        True if expert training should be applied, False otherwise
+    """
+    # Apply expert training at intervals starting from epoch 10
+    # epoch 10, 20, 30, 40, etc.
+    return epoch > 0 and (epoch + 1) % expert_interval == 0
+
+
+def compute_interval_expert_weight(expert_weight: float = 0.6) -> float:
+    """
+    Compute the weight for expert loss for interval-based expert training.
+    Returns a constant weight value when expert training is active.
+    
+    Args:
+        expert_weight: Fixed weight for expert samples
+    
+    Returns:
+        Expert loss weight
+    """
+    return expert_weight

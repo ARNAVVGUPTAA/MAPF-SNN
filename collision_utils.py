@@ -10,6 +10,38 @@ import os
 from typing import Dict, List, Tuple, Optional
 
 
+def generate_safe_dummy_positions(num_agents: int = 5, board_size: int = 28, 
+                                 position_type: str = "start") -> torch.Tensor:
+    """
+    Generate safe dummy positions for agents with maximum spread to minimize collisions.
+    No obstacles are generated, just spread-out positions.
+    
+    Args:
+        num_agents: Number of agents to generate positions for
+        board_size: Size of the board
+        position_type: Type of positions ("start" or "goal")
+        
+    Returns:
+        safe_positions: Safe dummy positions [num_agents, 2]
+    """
+    dummy_positions = []
+    
+    if position_type == "start":
+        # For start positions, spread agents across the map
+        for agent_id in range(num_agents):
+            x = (agent_id * 5) % board_size  # Spread horizontally every 5 units
+            y = (agent_id * 3) % board_size  # Spread vertically every 3 units
+            dummy_positions.append([float(x), float(y)])
+    else:  # goal positions
+        # For goal positions, place them on opposite side of the map from starts
+        for agent_id in range(num_agents):
+            x = (board_size - 5 - agent_id * 2) % board_size  # Goals on opposite side
+            y = (board_size - 3 - agent_id * 2) % board_size  # Goals spread diagonally
+            dummy_positions.append([float(x), float(y)])
+    
+    return torch.tensor(dummy_positions, dtype=torch.float32)
+
+
 def detect_collisions(positions: torch.Tensor, prev_positions: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
     """
     Detect various types of collisions between agents.
@@ -67,6 +99,41 @@ def detect_collisions(positions: torch.Tensor, prev_positions: Optional[torch.Te
     }
 
 
+def compute_per_agent_collision_losses(logits: torch.Tensor, 
+                                     immediate_penalty: torch.Tensor,
+                                     collision_config: Dict) -> torch.Tensor:
+    """
+    Compute per-agent collision losses that can be applied to individual agent predictions.
+    
+    Args:
+        logits: Action logits [batch * num_agents, num_actions]
+        immediate_penalty: Collision penalties per agent [batch, num_agents]
+        collision_config: Collision configuration dictionary
+        
+    Returns:
+        per_agent_losses: Collision losses per agent [batch * num_agents]
+    """
+    batch_size, num_agents = immediate_penalty.shape
+    device = immediate_penalty.device
+    
+    # Reshape penalty to match logits shape [batch * num_agents]
+    penalty_flat = immediate_penalty.view(-1)  # [batch * num_agents]
+    
+    # Compute loss based on collision type
+    collision_loss_type = collision_config.get('collision_loss_type', 'l2')
+    
+    if collision_loss_type == 'l1':
+        per_agent_losses = penalty_flat
+    elif collision_loss_type == 'l2':
+        per_agent_losses = penalty_flat ** 2
+    elif collision_loss_type == 'exponential':
+        per_agent_losses = torch.exp(penalty_flat) - 1
+    else:
+        per_agent_losses = penalty_flat
+    
+    return per_agent_losses
+
+
 def compute_collision_loss(logits: torch.Tensor, 
                           positions: torch.Tensor,
                           prev_positions: Optional[torch.Tensor] = None,
@@ -92,7 +159,8 @@ def compute_collision_loss(logits: torch.Tensor,
             'future_collision_steps': 2,
             'future_collision_weight': 0.8,
             'future_step_decay': 0.7,
-            'separate_collision_types': True  # New flag to handle collisions separately
+            'separate_collision_types': True,  # New flag to handle collisions separately
+            'per_agent_loss': True  # New flag to compute per-agent losses
         }
     
     # Detect immediate collisions
@@ -108,23 +176,51 @@ def compute_collision_loss(logits: torch.Tensor,
     # Total immediate collision penalty per agent
     immediate_penalty = vertex_penalty + edge_penalty  # [batch, num_agents]
     
-    # Initialize collision losses
-    real_collision_loss = torch.tensor(0.0, device=device)
-    future_collision_loss = torch.tensor(0.0, device=device)
+    # Check if we should compute per-agent losses
+    use_per_agent_loss = collision_config.get('per_agent_loss', True)
     
-    # Compute real collision loss
-    if collision_config['collision_loss_type'] == 'l1':
-        real_collision_loss = torch.mean(immediate_penalty)
-    elif collision_config['collision_loss_type'] == 'l2':
-        real_collision_loss = torch.mean(immediate_penalty ** 2)
-    elif collision_config['collision_loss_type'] == 'exponential':
-        real_collision_loss = torch.mean(torch.exp(immediate_penalty) - 1)
+    if use_per_agent_loss:
+        # Compute per-agent collision losses that can be applied to individual agent predictions
+        per_agent_collision_losses = compute_per_agent_collision_losses(
+            logits, immediate_penalty, collision_config
+        )
+        
+        # Also compute aggregate statistics for logging
+        if collision_config['collision_loss_type'] == 'l1':
+            aggregate_collision_loss = torch.mean(immediate_penalty)
+        elif collision_config['collision_loss_type'] == 'l2':
+            aggregate_collision_loss = torch.mean(immediate_penalty ** 2)
+        elif collision_config['collision_loss_type'] == 'exponential':
+            aggregate_collision_loss = torch.mean(torch.exp(immediate_penalty) - 1)
+        else:
+            aggregate_collision_loss = torch.mean(immediate_penalty)
+        
+        total_collision_loss = per_agent_collision_losses
+        real_collision_loss = aggregate_collision_loss
+        
     else:
-        real_collision_loss = torch.mean(immediate_penalty)
+        # Legacy behavior: compute single aggregate loss
+        # Initialize collision losses
+        real_collision_loss = torch.tensor(0.0, device=device)
+        
+        # Compute real collision loss
+        if collision_config['collision_loss_type'] == 'l1':
+            real_collision_loss = torch.mean(immediate_penalty)
+        elif collision_config['collision_loss_type'] == 'l2':
+            real_collision_loss = torch.mean(immediate_penalty ** 2)
+        elif collision_config['collision_loss_type'] == 'exponential':
+            real_collision_loss = torch.mean(torch.exp(immediate_penalty) - 1)
+        else:
+            real_collision_loss = torch.mean(immediate_penalty)
+        
+        total_collision_loss = real_collision_loss
     
-    # Compute future collision penalty separately (only if no current collision)
+    # Future collision penalty is not implemented for per-agent losses yet
+    # (can be added later if needed)
+    future_collision_loss = torch.tensor(0.0, device=device)
     future_penalty_value = 0.0
-    if collision_config.get('use_future_collision_penalty', False):
+    
+    if not use_per_agent_loss and collision_config.get('use_future_collision_penalty', False):
         future_steps = collision_config.get('future_collision_steps', 2)
         step_decay = collision_config.get('future_step_decay', 0.7)
         
@@ -152,18 +248,15 @@ def compute_collision_loss(logits: torch.Tensor,
         
         future_penalty_value = float(future_penalty_tensor.item())
         future_collision_loss = collision_config.get('future_collision_weight', 0.8) * future_penalty_tensor
-    
-    # Total collision loss - either real OR future, not both
-    if collision_config.get('separate_collision_types', True):
-        # Only add future collision loss if there are no real collisions
-        has_real_collisions = torch.sum(immediate_penalty) > 0
-        if has_real_collisions:
-            total_collision_loss = real_collision_loss
+        
+        # Total collision loss - combine both real and future losses
+        if collision_config.get('separate_collision_types', True):
+            # Blend real and future collision losses with configurable factor
+            alpha = collision_config.get('future_blend_factor', 0.5)  # Default blend factor
+            total_collision_loss = real_collision_loss + alpha * future_collision_loss
         else:
-            total_collision_loss = future_collision_loss
-    else:
-        # Old behavior: add both (may lead to double penalization)
-        total_collision_loss = real_collision_loss + future_collision_loss
+            # Add both losses with equal weight (legacy behavior)
+            total_collision_loss = real_collision_loss + future_collision_loss
     
     # Collect collision information for logging
     collision_info = {
@@ -173,9 +266,11 @@ def compute_collision_loss(logits: torch.Tensor,
         'real_collision_rate': torch.mean((immediate_penalty > 0).float()).item(),
         'avg_real_collision_penalty': torch.mean(immediate_penalty).item(),
         'future_collision_penalty': future_penalty_value,
-        'real_collision_loss': float(real_collision_loss.item()),
+        'real_collision_loss': float(real_collision_loss.item()) if isinstance(real_collision_loss, torch.Tensor) else real_collision_loss,
         'future_collision_loss': float(future_collision_loss.item()),
-        'using_real_collision_loss': torch.sum(immediate_penalty) > 0 if collision_config.get('separate_collision_types', True) else True
+        'using_real_collision_loss': True,  # Always using both losses now
+        'future_blend_factor': collision_config.get('future_blend_factor', 0.5) if collision_config.get('separate_collision_types', True) else 1.0,
+        'per_agent_loss': use_per_agent_loss
     }
     
     return total_collision_loss, collision_info
@@ -248,12 +343,24 @@ def predict_future_collisions(current_positions: torch.Tensor,
     positions = current_positions.clone()
     
     for step in range(steps):
-        # Sample actions based on probabilities
-        actions = torch.multinomial(action_probs.view(-1, action_probs.size(-1)), 1).squeeze(-1)
-        actions = actions.view(batch_size, num_agents)
+        # Use expected position computation instead of sampling for differentiability
+        # Action mapping: 0=stay, 1=right, 2=up, 3=left, 4=down
+        action_deltas = torch.tensor([
+            [0, 0],   # 0: Stay
+            [1, 0],   # 1: Right
+            [0, 1],   # 2: Up
+            [-1, 0],  # 3: Left
+            [0, -1]   # 4: Down
+        ], device=device, dtype=torch.float32)
         
-        # Predict next positions
-        next_positions = extract_positions_from_actions(positions, actions, board_size)
+        # Compute expected deltas: action_probs @ action_deltas [batch, agents, 2]
+        expected_deltas = torch.einsum('ban,nd->bad', action_probs, action_deltas)  # [batch, agents, 2]
+        
+        # Predict next positions using expected movement
+        next_positions = positions + expected_deltas
+        
+        # Apply boundary constraints
+        next_positions = torch.clamp(next_positions, 0, board_size - 1)
         
         # Detect collisions at this future step
         collisions = detect_collisions(next_positions, positions)
@@ -385,10 +492,12 @@ def load_initial_positions_from_dataset(dataset_root: str, case_indices: List[in
         input_yaml_path = os.path.join(dataset_path, case_name, "input.yaml")
         
         if not os.path.exists(input_yaml_path):
-            print(f"Warning: input.yaml not found for {case_name}, using dummy positions")
-            # Fallback to dummy positions if file not found
-            dummy_positions = torch.randint(0, 28, (5, 2), dtype=torch.float32)
-            initial_positions_list.append(dummy_positions)
+            print(f"WARNING: [FALLBACK TRIGGERED] input.yaml not found for {case_name}, using SAFE dummy positions")
+            print(f"         Generating obstacle-free dummy map. Dataset path: {input_yaml_path}")
+            # Use safe dummy positions - spread agents with no obstacles
+            dummy_positions_tensor = generate_safe_dummy_positions(num_agents=5, position_type="start")
+            print(f"         Generated safe spread positions: {dummy_positions_tensor}")
+            initial_positions_list.append(dummy_positions_tensor)
             continue
             
         try:
@@ -406,10 +515,108 @@ def load_initial_positions_from_dataset(dataset_root: str, case_indices: List[in
             initial_positions_list.append(positions_tensor)
             
         except Exception as e:
-            print(f"Error loading {input_yaml_path}: {e}, using dummy positions")
-            dummy_positions = torch.randint(0, 28, (5, 2), dtype=torch.float32)
-            initial_positions_list.append(dummy_positions)
+            print(f"ERROR: [FALLBACK TRIGGERED] Error loading {input_yaml_path}: {e}")
+            print(f"       Using SAFE dummy positions - generating obstacle-free map!")
+            # Use safe dummy positions instead of random ones
+            dummy_positions_tensor = generate_safe_dummy_positions(num_agents=5, position_type="start")
+            print(f"       Generated safe spread positions: {dummy_positions_tensor}")
+            initial_positions_list.append(dummy_positions_tensor)
     
     # Stack all initial positions
     initial_positions = torch.stack(initial_positions_list, dim=0)
     return initial_positions
+
+
+def load_goal_positions_from_dataset(dataset_root: str, case_indices: List[int], 
+                                    mode: str = "train") -> torch.Tensor:
+    """
+    Load goal agent positions from input.yaml files in the dataset.
+    
+    Args:
+        dataset_root: Root directory of the dataset (e.g., 'dataset/5_8_28')
+        case_indices: List of case indices to load goal positions for
+        mode: Dataset mode ('train' or 'val')
+        
+    Returns:
+        goal_positions: Goal positions tensor [num_cases, num_agents, 2]
+    """
+    dataset_path = os.path.join(dataset_root, mode)
+    goal_positions_list = []
+    
+    for case_idx in case_indices:
+        case_name = f"case_{case_idx}"
+        input_yaml_path = os.path.join(dataset_path, case_name, "input.yaml")
+        
+        if not os.path.exists(input_yaml_path):
+            print(f"WARNING: [FALLBACK TRIGGERED] input.yaml not found for {case_name}, using SAFE dummy goal positions")
+            print(f"         Generating obstacle-free dummy map. Dataset path: {input_yaml_path}")
+            # Use safe dummy goal positions - spread goals with no obstacles
+            dummy_positions_tensor = generate_safe_dummy_positions(num_agents=5, position_type="goal")
+            print(f"         Generated safe spread goal positions: {dummy_positions_tensor}")
+            goal_positions_list.append(dummy_positions_tensor)
+            continue
+            
+        try:
+            with open(input_yaml_path, 'r') as f:
+                data = yaml.safe_load(f)
+                
+            agents = data.get('agents', [])
+            positions = []
+            
+            for agent in agents:
+                goal_pos = agent.get('goal', [0, 0])
+                positions.append([float(goal_pos[0]), float(goal_pos[1])])
+                
+            positions_tensor = torch.tensor(positions, dtype=torch.float32)
+            goal_positions_list.append(positions_tensor)
+            
+        except Exception as e:
+            print(f"ERROR: [FALLBACK TRIGGERED] Error loading {input_yaml_path}: {e}")
+            print(f"       Using SAFE dummy goal positions - generating obstacle-free map!")
+            # Use safe dummy goal positions instead of random ones
+            dummy_positions_tensor = generate_safe_dummy_positions(num_agents=5, position_type="goal")
+            print(f"       Generated safe spread goal positions: {dummy_positions_tensor}")
+            goal_positions_list.append(dummy_positions_tensor)
+    
+    # Stack all goal positions
+    goal_positions = torch.stack(goal_positions_list, dim=0)
+    return goal_positions
+
+
+def compute_goal_proximity_reward(current_positions: torch.Tensor, goal_positions: torch.Tensor,
+                                 reward_type: str = 'inverse', max_distance: float = 10.0) -> torch.Tensor:
+    """
+    Compute goal proximity reward based on distance to goal positions.
+    
+    Args:
+        current_positions: Current agent positions [batch_size, num_agents, 2]
+        goal_positions: Goal positions [batch_size, num_agents, 2]
+        reward_type: Type of reward computation ('inverse', 'exponential', 'linear')
+        max_distance: Maximum distance for reward normalization
+        
+    Returns:
+        proximity_reward: Proximity reward scalar for the batch
+    """
+    # Compute Euclidean distances to goals
+    distances = torch.norm(current_positions - goal_positions, dim=2)  # [batch_size, num_agents]
+    
+    if reward_type == 'inverse':
+        # Inverse distance reward: closer = higher reward
+        # Add small epsilon to avoid division by zero and clamp to reasonable range
+        epsilon = 1e-6
+        rewards = 1.0 / (distances + epsilon)
+        # Clamp rewards to prevent extreme values
+        rewards = torch.clamp(rewards, max=10.0)  # Cap at 10 to prevent loss explosion
+    elif reward_type == 'exponential':
+        # Exponential decay reward: exp(-distance/scale)
+        scale = max_distance / 3.0  # Scale factor for exponential decay
+        rewards = torch.exp(-distances / scale)
+    elif reward_type == 'linear':
+        # Linear reward: (max_distance - distance) / max_distance
+        rewards = torch.clamp((max_distance - distances) / max_distance, min=0.0)
+    else:
+        raise ValueError(f"Unknown reward_type: {reward_type}")
+    
+    # Average reward across all agents and batch
+    proximity_reward = torch.mean(rewards)
+    return proximity_reward

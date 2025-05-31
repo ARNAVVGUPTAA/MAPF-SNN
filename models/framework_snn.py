@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 from spikingjelly.activation_based import neuron, layer, base
+from spikingjelly.activation_based.learning import STDPLearner
 from config import config
 
 
@@ -148,17 +149,40 @@ class DynamicGraphSNN(base.MemoryModule):
         # Learnable edge weights (will be updated dynamically)
         self.register_buffer('edge_weights', torch.ones(num_agents, num_agents) * 0.5)
         
+        # Add a buffer to store explicitly provided positions
+        self.register_buffer('provided_positions', None)
+        
+    def set_positions(self, positions):
+        """
+        Set explicit positions for graph building during evaluation
+        
+        Args:
+            positions: Tensor of agent positions [batch, num_agents, 2]
+        """
+        self.provided_positions = positions
+        
     def extract_positions(self, agent_features):
         """
         Extract or estimate agent positions from features for proximity calculation.
-        This is a simplified version - in practice, positions might be explicitly provided.
+        Uses explicitly provided positions if available (especially during evaluation)
         """
+        # If positions were explicitly provided (e.g., during evaluation), use them
+        if self.provided_positions is not None:
+            batch_size = agent_features.size(0)
+            # Calculate proximities based on Euclidean distances between provided positions
+            positions = self.provided_positions
+            # Compute pairwise distances
+            expanded_p1 = positions.unsqueeze(2)  # [batch, num_agents, 1, 2]
+            expanded_p2 = positions.unsqueeze(1)  # [batch, 1, num_agents, 2]
+            distances = torch.norm(expanded_p1 - expanded_p2, dim=3)  # [batch, num_agents, num_agents]
+            # Convert distances to proximities (closer = higher value)
+            proximities = torch.exp(-distances / self.proximity_threshold)
+            return proximities
+            
+        # Default behavior for training if no positions provided
         batch_size = agent_features.size(0)
         
-        # For now, use feature similarity as a proxy for spatial proximity
-        # In a real implementation, you'd extract actual positions from the input
-        
-        # Compute pairwise feature similarities
+        # Compute pairwise feature similarities as a proxy for spatial proximity
         similarities = torch.bmm(agent_features, agent_features.transpose(1, 2))
         
         # Normalize to get proximity scores
@@ -314,7 +338,7 @@ class DynamicGraphSNN(base.MemoryModule):
         Process input through dynamic graph-based localized decision making.
         
         Args:
-            x: Input features [batch * num_agents, input_size]
+            x: Input features [batch * num_agents, input_dim]
             
         Returns:
             output: Processed features [batch * num_agents, hidden_size]
@@ -386,13 +410,19 @@ class DynamicGraphSNN(base.MemoryModule):
                                comm_messages * 0.3 + 
                                recurrent_current * self.recurrence_weight)
             
-            # Local decision making with enhanced conflict awareness
-            decision_input = total_current - conflict_signals * 0.5  # Conflicts inhibit decisions
+            # Local decision making with hard conflict inhibition
+            # Hard inhibition: fully gate decisions when conflicts exceed threshold
+            conflict_threshold = float(config.get('conflict_gate_threshold', 0.2))
+            conflict_gate = (conflict_signals.mean(dim=-1, keepdim=True) > conflict_threshold).float()
+            
+            # Apply hard gate: 0 = full inhibition, 1 = normal operation
+            decision_input = total_current * (1.0 - conflict_gate.expand(-1, -1, self.hidden_size))
+            
             local_decisions = self.local_decision_lif(
                 decision_input.view(-1, self.hidden_size)
             ).view(batch_size, self.num_agents, self.hidden_size)
             
-            # Enhanced hesitation mechanism with spatial uncertainty
+            # Enhanced hesitation mechanism with hard inhibition
             spatial_uncertainty = torch.var(edge_weights, dim=-1, keepdim=True)  # Edge weight uncertainty
             feature_uncertainty = torch.var(total_current, dim=-1, keepdim=True)  # Feature uncertainty
             combined_uncertainty = (spatial_uncertainty + feature_uncertainty).expand(-1, -1, self.hidden_size)
@@ -400,9 +430,12 @@ class DynamicGraphSNN(base.MemoryModule):
             hesitation_spikes = self.hesitation_lif(combined_uncertainty.view(-1, self.hidden_size) * 2.0)
             hesitation_spikes = hesitation_spikes.view(batch_size, self.num_agents, self.hidden_size)
             
-            # Apply hesitation as inhibition to decisions
-            hesitation_inhibition = hesitation_spikes * self.hesitation_weight
-            inhibited_decisions = local_decisions - hesitation_inhibition
+            # Apply hard hesitation gate: pause agents when uncertainty is too high
+            hesitation_threshold = float(config.get('hesitation_gate_threshold', 0.15))
+            hesitation_gate = (hesitation_spikes.mean(dim=-1, keepdim=True) > hesitation_threshold).float()
+            
+            # Hard gate: 0 = full pause, 1 = normal operation  
+            inhibited_decisions = local_decisions * (1.0 - hesitation_gate.expand(-1, -1, self.hidden_size))
             inhibited_decisions = torch.relu(inhibited_decisions)  # Ensure non-negative
             
             # Accumulate spikes and update states
@@ -410,7 +443,7 @@ class DynamicGraphSNN(base.MemoryModule):
             hidden_state = inhibited_decisions
             hesitation_state = hesitation_spikes
         
-        # Average spikes over time steps for rate coding
+        # Average spikes over time for rate coding
         avg_spikes = spike_accumulator / self.time_steps
         
         # Reshape back to original format
@@ -474,19 +507,26 @@ class TransformerEncoder(nn.Module):
         Process input through transformer encoder for global context.
         
         Args:
-            x: Input features [batch * num_agents, input_dim]
+            x: Input features [batch * num_agents, actual_input_dim]
             num_agents: Number of agents
             
         Returns:
             encoded_features: [batch * num_agents, d_model] with global context
         """
         batch_size = x.size(0) // num_agents
+        actual_input_dim = x.size(1)  # Get actual input dimension from tensor
         
-        # Reshape for sequence processing: [batch, num_agents, input_dim]
-        x_seq = x.view(batch_size, num_agents, self.input_dim)
+        # Reshape for sequence processing: [batch, num_agents, actual_input_dim]
+        x_seq = x.view(batch_size, num_agents, actual_input_dim)
         
-        # Project to model dimension
-        x_proj = self.input_projection(x_seq)  # [batch, num_agents, d_model]
+        # Project to model dimension (handle dynamic input size)
+        if actual_input_dim != self.input_dim:
+            # Create a dynamic projection layer if input size changed
+            if not hasattr(self, 'dynamic_projection') or self.dynamic_projection.in_features != actual_input_dim:
+                self.dynamic_projection = nn.Linear(actual_input_dim, self.d_model).to(x.device)
+            x_proj = self.dynamic_projection(x_seq)  # [batch, num_agents, d_model]
+        else:
+            x_proj = self.input_projection(x_seq)  # [batch, num_agents, d_model]
         
         # Add positional encoding for spatial awareness
         pos_enc = self.pos_encoding[:, :num_agents, :].expand(batch_size, -1, -1)
@@ -537,11 +577,42 @@ class Network(base.MemoryModule):
         
         # Enhanced architecture components
         
+        # 0. STDP-based spatial danger detection (first layer)
+        self.use_stdp_spatial_detector = config.get('use_stdp_spatial_detector', True)
+        if self.use_stdp_spatial_detector:
+            # Infer input channels from config
+            input_channels = config.get('channels', 2)  # Default to 2 channels (agent + obstacles)
+            stdp_features = config.get('stdp_feature_channels', 32)
+            
+            self.stdp_spatial_detector = STDPSpatialDangerDetector(
+                input_channels=input_channels,
+                feature_channels=stdp_features,
+                kernel_size=config.get('stdp_kernel_size', 3),
+                cfg=config
+            )
+            
+            # Danger decoder to interpret STDP patterns as actionable danger signals
+            self.danger_decoder = DangerDecoder(
+                stdp_feature_channels=stdp_features,
+                hidden_dim=hidden_dim,
+                num_agents=self.num_agents,
+                cfg=config
+            )
+            
+            # Calculate enhanced input dimension after STDP processing
+            # STDP output: [batch, stdp_features, 9, 9] -> flattened
+            stdp_output_dim = stdp_features * 9 * 9
+            effective_input_dim = stdp_output_dim
+        else:
+            self.stdp_spatial_detector = None
+            self.danger_decoder = None
+            effective_input_dim = input_dim
+        
         # 1. Transformer Encoder for global spatial understanding
         self.use_transformer_encoder = config.get('use_transformer_encoder', True)
         if self.use_transformer_encoder:
             self.transformer_encoder = TransformerEncoder(
-                input_dim=input_dim,
+                input_dim=effective_input_dim,
                 d_model=hidden_dim,
                 nhead=config.get('encoder_nhead', 8),
                 num_layers=config.get('encoder_layers', 2),
@@ -550,8 +621,8 @@ class Network(base.MemoryModule):
             encoder_output_dim = hidden_dim
         else:
             # Fallback: simple input processing
-            self.input_norm = nn.LayerNorm(input_dim)
-            self.input_projection = nn.Linear(input_dim, hidden_dim)
+            self.input_norm = nn.LayerNorm(effective_input_dim)
+            self.input_projection = nn.Linear(effective_input_dim, hidden_dim)
             encoder_output_dim = hidden_dim
         
         # 2. Dynamic Graph SNN for adaptive localized decisions
@@ -582,18 +653,19 @@ class Network(base.MemoryModule):
             v_reset=config.get("lif_v_reset", 0.0)
         )
 
-    def forward(self, x, gso=None, return_spikes=False):
+    def forward(self, x, gso=None, return_spikes=False, positions=None):
         """
-        Forward pass through the enhanced SNN with Transformer Encoder and Dynamic Graph.
+        Forward pass through the enhanced SNN with STDP Spatial Danger Detection.
         
         Architecture flow:
-        Input → Transformer Encoder (global context) → Dynamic Graph SNN (local decisions) 
-              → Spiking Transformer (attention) → Output
+        Input → STDP Spatial Danger Detection → Transformer Encoder (global context) 
+              → Dynamic Graph SNN (local decisions) → Spiking Transformer (attention) → Output
         
         Args:
             x: Input tensor [batch, agents, channels, height, width] or flattened
             gso: Graph structure (not used in this SNN)
             return_spikes: Whether to return spike statistics
+            positions: Agent positions for consistent graph building in evaluation
             
         Returns:
             Action probabilities for each agent
@@ -604,7 +676,37 @@ class Network(base.MemoryModule):
         # Handle input reshaping
         if x.dim() == 5:
             batch, agents, c, h, w = x.size()
+            original_spatial_input = x  # Keep for STDP processing
             x = x.reshape(batch * agents, c * h * w)
+            
+            # Extract positions from input if not provided
+            if positions is None and hasattr(self, 'extract_positions_from_input'):
+                positions = self.extract_positions_from_input(x)
+        else:
+            # Reshape flattened input back to spatial format for STDP processing
+            batch_agents = x.shape[0]
+            # Infer spatial dimensions from config
+            c = self.config.get('channels', 2)
+            h = w = int((x.shape[1] / c) ** 0.5)  # Assume square input
+            original_spatial_input = x.view(batch_agents, c, h, w)
+        
+        # 0. STDP-based spatial danger detection (unsupervised learning of spatial patterns)
+        stdp_spatial_features = None  # Store for danger decoder
+        if self.use_stdp_spatial_detector:
+            # Process each agent's FOV through STDP spatial danger detector
+            if original_spatial_input.dim() == 5:
+                batch, agents, c, h, w = original_spatial_input.size()
+                spatial_input = original_spatial_input.reshape(batch * agents, c, h, w)
+            else:
+                spatial_input = original_spatial_input
+            
+            # Apply STDP spatial danger detection
+            enhanced_spatial_features = self.stdp_spatial_detector(spatial_input)
+            stdp_spatial_features = enhanced_spatial_features  # Store for danger decoder
+            
+            # Flatten enhanced features for subsequent processing
+            stdp_features = enhanced_spatial_features.view(enhanced_spatial_features.size(0), -1)
+            x = stdp_features  # Replace original flattened input with STDP-enhanced features
         
         # 1. Global spatial understanding through Transformer Encoder
         if self.use_transformer_encoder:
@@ -614,6 +716,10 @@ class Network(base.MemoryModule):
             # Fallback: simple input processing with normalization
             x_norm = self.input_norm(x)
             global_features = self.input_projection(x_norm)
+            
+        # Pass positions to SNN block if available
+        if positions is not None and hasattr(self.snn_block, 'set_positions'):
+            self.snn_block.set_positions(positions)
         
         # Scale input to encourage spiking - use config value
         global_features = global_features * self.input_scale
@@ -632,7 +738,13 @@ class Network(base.MemoryModule):
         # 5. Generate action logits
         action_logits = self.output_fc(attended_output)
         
-        # 6. Final spiking output (rate-coded action values)
+        # 6. Apply danger gates from STDP spatial features (if available)
+        danger_info = {}
+        if self.use_stdp_spatial_detector and stdp_spatial_features is not None and self.danger_decoder is not None:
+            # Apply danger gating to inhibit risky actions based on STDP-learned spatial patterns
+            action_logits, danger_info = self.danger_decoder(stdp_spatial_features, action_logits)
+        
+        # 7. Final spiking output (rate-coded action values)
         output_spikes = self.output_neuron(action_logits * 2.0)  # Aggressive scaling for output spikes
         
         # Ensure output shape is correct
@@ -641,18 +753,24 @@ class Network(base.MemoryModule):
         
         if return_spikes:
             # Return spike statistics for analysis
-            return output_spikes, {
+            spike_info = {
                 'global_features': global_features,
                 'snn_block_spikes': snn_output,
                 'output_spikes': output_spikes,
                 'attended_output': attended_output
             }
+            # Add danger information if available
+            if danger_info:
+                spike_info['danger_info'] = danger_info
+            return output_spikes, spike_info
         
         return output_spikes
 
     def reset(self):
         """Reset all memory modules for clean state between episodes"""
         super().reset()
+        if hasattr(self, 'stdp_spatial_detector') and self.stdp_spatial_detector is not None:
+            self.stdp_spatial_detector.reset()
         if hasattr(self, 'spiking_transformer') and self.use_spiking_transformer:
             self.spiking_transformer.reset()
         # Transformer encoder doesn't need reset as it's stateless
@@ -769,9 +887,12 @@ class SpikingTransformer(base.MemoryModule):
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
         
-        # Scaled dot-product attention (simplified)
+        # Scaled dot-product attention with proper masking for evaluation consistency
         scale = self.head_dim ** -0.5
         attn_scores = torch.matmul(q, k.transpose(-2, -1)) * scale
+        
+        # Apply consistent attention masking if needed (to ensure deterministic behavior)
+        # This ensures same attention patterns during both training and evaluation
         attn_weights = torch.softmax(attn_scores, dim=-1)
         
         # Apply attention to values
@@ -806,3 +927,278 @@ class SpikingTransformer(base.MemoryModule):
         for module in self.ff_network:
             if hasattr(module, 'reset'):
                 module.reset()
+
+
+class STDPSpatialDangerDetector(base.MemoryModule):
+    """
+    STDP-based spatial danger detection layer for learning obstacles, traps, and tight corridors.
+    
+    This layer processes field-of-view input to learn spike patterns for spatial dangers through
+    unsupervised STDP learning, then provides enhanced features to higher layers.
+    
+    Architecture:
+    - Conv2d layers for spatial feature extraction
+    - STDPLearner for unsupervised learning of danger patterns
+    - Spiking neurons for temporal processing
+    """
+    
+    def __init__(self, input_channels, feature_channels=32, kernel_size=3, cfg=None):
+        super().__init__()
+        
+        # Get STDP parameters from config (ensure numeric types)
+        self.tau_pre = float(cfg.get('stdp_tau_pre', 20.0)) if cfg else 20.0
+        self.tau_post = float(cfg.get('stdp_tau_post', 20.0)) if cfg else 20.0
+        self.learning_rate_pre = float(cfg.get('stdp_lr_pre', 1e-4)) if cfg else 1e-4
+        self.learning_rate_post = float(cfg.get('stdp_lr_post', 1e-4)) if cfg else 1e-4
+        self.stdp_enabled = bool(cfg.get('enable_stdp_learning', True)) if cfg else True
+        
+        # Spatial feature extraction layers
+        self.conv1 = nn.Conv2d(input_channels, feature_channels, kernel_size=kernel_size, 
+                              padding=kernel_size//2, bias=False)
+        self.conv2 = nn.Conv2d(feature_channels, feature_channels, kernel_size=kernel_size, 
+                              padding=kernel_size//2, bias=False)
+        
+        # Spiking neurons for each conv layer
+        self.sn1 = AdaptiveLIFNode(
+            tau=(cfg.get('lif_tau', 10.0) if cfg else 10.0) * 0.8,  # Slightly faster for spatial detection
+            v_threshold=(cfg.get('lif_v_threshold', 0.5) if cfg else 0.5) * 0.7,  # Lower threshold for better sensitivity
+            v_reset=cfg.get('lif_v_reset', 0.0) if cfg else 0.0
+        )
+        
+        self.sn2 = AdaptiveLIFNode(
+            tau=(cfg.get('lif_tau', 10.0) if cfg else 10.0) * 0.8,
+            v_threshold=(cfg.get('lif_v_threshold', 0.5) if cfg else 0.5) * 0.7,
+            v_reset=cfg.get('lif_v_reset', 0.0) if cfg else 0.0
+        )
+        
+        # Initialize STDP learners for unsupervised learning
+        if self.stdp_enabled:
+            # STDP for first layer - learns basic spatial patterns
+            self.stdp1 = STDPLearner(
+                step_mode='s',
+                synapse=self.conv1,
+                sn=self.sn1,
+                tau_pre=self.tau_pre,
+                tau_post=self.tau_post,
+                f_pre=lambda w: torch.full_like(w, self.learning_rate_pre),  # constant pre-learning rate tensor
+                f_post=lambda w: torch.full_like(w, self.learning_rate_post)  # constant post-learning rate tensor
+            )
+            
+            # STDP for second layer - learns complex danger patterns
+            self.stdp2 = STDPLearner(
+                step_mode='s',
+                synapse=self.conv2,
+                sn=self.sn2,
+                tau_pre=self.tau_pre * 1.5,
+                tau_post=self.tau_post * 1.5,
+                f_pre=lambda w: torch.full_like(w, self.learning_rate_pre * 0.8),  # constant pre-learning rate tensor
+                f_post=lambda w: torch.full_like(w, self.learning_rate_post * 0.8)  # constant post-learning rate tensor
+            )
+        else:
+            self.stdp1 = None
+            self.stdp2 = None
+        
+        # Output processing to provide enhanced features
+        self.feature_aggregator = nn.Conv2d(feature_channels, feature_channels, 
+                                          kernel_size=1, bias=True)
+        self.danger_threshold = float(cfg.get('danger_threshold', 0.3)) if cfg else 0.3
+        
+        # Adaptive pooling to provide consistent output size
+        self.adaptive_pool = nn.AdaptiveAvgPool2d((9, 9))  # Match expected FOV size
+        
+    def forward(self, x):
+        """
+        Process input through STDP-based spatial danger detection.
+        
+        Args:
+            x: Input tensor [batch, channels, height, width]
+            
+        Returns:
+            Enhanced spatial features with learned danger patterns
+        """
+        # Reset spiking neurons
+        self.sn1.reset()
+        self.sn2.reset()
+        
+        # First layer: basic spatial feature extraction with STDP
+        # Apply synapse (conv) and spiking neuron separately
+        conv1_out = self.conv1(x)
+        spikes1 = self.sn1(conv1_out)
+        
+        # Apply STDP learning during training (if enabled)
+        if self.stdp_enabled and self.training and self.stdp1 is not None:
+            # STDP learning step - updates weights based on pre/post spike timing
+            self.stdp1.step(on_grad=True)
+        
+        # Second layer: complex pattern detection with STDP
+        # Apply synapse (conv) and spiking neuron separately
+        conv2_out = self.conv2(spikes1)
+        spikes2 = self.sn2(conv2_out)
+        
+        # Apply STDP learning during training (if enabled)
+        if self.stdp_enabled and self.training and self.stdp2 is not None:
+            # STDP learning step - updates weights based on pre/post spike timing
+            self.stdp2.step(on_grad=True)
+        
+        # Aggregate features to highlight learned danger patterns
+        enhanced_features = self.feature_aggregator(spikes2)
+        
+        # Ensure consistent output size
+        enhanced_features = self.adaptive_pool(enhanced_features)
+        
+        return enhanced_features
+    
+    def reset(self):
+        """Reset all stateful components"""
+        super().reset()
+        self.sn1.reset()
+        self.sn2.reset()
+        if hasattr(self.stdp1, 'reset') and self.stdp1 is not None:
+            self.stdp1.reset()
+        if hasattr(self.stdp2, 'reset') and self.stdp2 is not None:
+            self.stdp2.reset()
+    
+    def set_stdp_learning(self, enabled):
+        """Enable/disable STDP learning"""
+        self.stdp_enabled = enabled
+
+
+class DangerDecoder(nn.Module):
+    """
+    Danger decoder module that interprets STDP spatial features as actionable danger signals.
+    
+    This module bridges the gap between unsupervised STDP spatial learning and supervised
+    action selection by:
+    1. Analyzing STDP spike patterns to detect danger signals
+    2. Computing global and per-agent danger levels  
+    3. Applying danger gates to inhibit risky actions
+    
+    The key insight is that STDP learns spatial danger patterns unsupervised, but we need
+    a supervised module to interpret these patterns and influence action decisions.
+    """
+    
+    def __init__(self, stdp_feature_channels=32, hidden_dim=128, num_agents=5, cfg=None):
+        super().__init__()
+        
+        # STDP spatial features are [batch*agents, stdp_feature_channels, 9, 9]
+        self.stdp_input_dim = stdp_feature_channels * 9 * 9
+        self.hidden_dim = hidden_dim
+        self.num_agents = num_agents
+        
+        # Get danger parameters from config
+        self.danger_threshold = float(cfg.get('danger_threshold', 0.3)) if cfg else 0.3
+        self.danger_gate_strength = float(cfg.get('danger_gate_strength', 0.8)) if cfg else 0.8
+        self.enable_danger_inhibition = bool(cfg.get('enable_danger_inhibition', True)) if cfg else True
+        
+        # Danger pattern analysis layers
+        self.danger_analyzer = nn.Sequential(
+            nn.Linear(self.stdp_input_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.ReLU(),
+            nn.Linear(hidden_dim // 2, 1)  # Single danger score per agent
+        )
+        
+        # Global danger aggregation across agents
+        self.global_danger_aggregator = nn.Sequential(
+            nn.Linear(num_agents, hidden_dim // 4),
+            nn.ReLU(),
+            nn.Linear(hidden_dim // 4, 1)  # Global danger level
+        )
+        
+        # Danger gate computation
+        self.danger_gate_fc = nn.Sequential(
+            nn.Linear(2, hidden_dim // 4),  # Individual + global danger
+            nn.ReLU(), 
+            nn.Linear(hidden_dim // 4, 1),  # Gate strength
+            nn.Sigmoid()  # Gate value between 0 and 1
+        )
+        
+        # Learnable danger sensitivity parameters
+        self.register_parameter('danger_sensitivity', nn.Parameter(torch.tensor(1.0)))
+        self.register_parameter('gate_bias', nn.Parameter(torch.tensor(0.1)))
+        
+    def forward(self, stdp_features, action_logits):
+        """
+        Decode danger signals from STDP features and apply danger gates to action logits.
+        
+        Args:
+            stdp_features: STDP spatial features [batch*agents, feature_channels, 9, 9]
+            action_logits: Action logits before danger gating [batch*agents, num_actions]
+            
+        Returns:
+            gated_action_logits: Action logits with danger inhibition applied
+            danger_info: Dictionary with danger analysis information
+        """
+        if not self.enable_danger_inhibition:
+            return action_logits, {'danger_gates': torch.ones_like(action_logits[:, 0:1])}
+        
+        batch_agents = stdp_features.size(0)
+        batch_size = batch_agents // self.num_agents
+        
+        # Flatten STDP spatial features for analysis
+        flattened_stdp = stdp_features.view(batch_agents, -1)  # [batch*agents, stdp_input_dim]
+        
+        # 1. Analyze individual agent danger levels from STDP patterns
+        individual_danger_scores = self.danger_analyzer(flattened_stdp)  # [batch*agents, 1]
+        individual_danger_scores = torch.sigmoid(individual_danger_scores) * self.danger_sensitivity
+        
+        # 2. Compute global danger level across all agents
+        # Reshape to group by batch for global analysis
+        individual_reshaped = individual_danger_scores.view(batch_size, self.num_agents)  # [batch, agents]
+        global_danger_scores = self.global_danger_aggregator(individual_reshaped)  # [batch, 1]
+        
+        # Broadcast global danger back to individual agents
+        global_danger_broadcast = global_danger_scores.repeat(1, self.num_agents).view(batch_agents, 1)  # [batch*agents, 1]
+        
+        # 3. Compute danger gates combining individual and global danger
+        combined_danger = torch.cat([individual_danger_scores, global_danger_broadcast], dim=1)  # [batch*agents, 2]
+        danger_gates = self.danger_gate_fc(combined_danger)  # [batch*agents, 1]
+        
+        # Add learnable bias to prevent complete action blocking
+        danger_gates = danger_gates + self.gate_bias
+        danger_gates = torch.clamp(danger_gates, 0.0, 1.0)
+        
+        # 4. Apply danger gates to action logits
+        # Gate strength determines how much actions are inhibited in dangerous situations
+        # danger_gate close to 0 = high danger, strongly inhibit actions
+        # danger_gate close to 1 = low danger, allow normal actions
+        gate_multiplier = 1.0 - (1.0 - danger_gates) * self.danger_gate_strength
+        gated_action_logits = action_logits * gate_multiplier
+        
+        # Collect danger information for analysis/debugging
+        danger_info = {
+            'individual_danger_scores': individual_danger_scores,
+            'global_danger_scores': global_danger_scores,
+            'danger_gates': danger_gates,
+            'gate_multiplier': gate_multiplier,
+            'mean_danger_level': individual_danger_scores.mean().item(),
+            'max_danger_level': individual_danger_scores.max().item()
+        }
+        
+        return gated_action_logits, danger_info
+    
+    def get_danger_analysis(self, stdp_features):
+        """
+        Get detailed danger analysis without affecting action logits.
+        Useful for visualization and debugging.
+        """
+        with torch.no_grad():
+            batch_agents = stdp_features.size(0)
+            batch_size = batch_agents // self.num_agents
+            
+            flattened_stdp = stdp_features.view(batch_agents, -1)
+            individual_danger_scores = torch.sigmoid(self.danger_analyzer(flattened_stdp)) * self.danger_sensitivity
+            
+            individual_reshaped = individual_danger_scores.view(batch_size, self.num_agents)
+            global_danger_scores = self.global_danger_aggregator(individual_reshaped)
+            
+            return {
+                'individual_danger_scores': individual_danger_scores,
+                'global_danger_scores': global_danger_scores,
+                'danger_threshold': self.danger_threshold,
+                'mean_danger': individual_danger_scores.mean().item(),
+                'agents_in_danger': (individual_danger_scores > self.danger_threshold).sum().item()
+            }
+

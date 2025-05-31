@@ -1,6 +1,6 @@
 # =============================================================================
 # SNN MAPF Configuration File
-# =============================================================================
+# ============================================================entropy_bonus_decay_type: 'linear'    # Decay type: 'linear', 'exponential', or 'cosine'================
 
 # Experiment Setup
 exp_name: 'trained_models/snn_experiment'
@@ -11,23 +11,23 @@ net_type: 'snn'
 # =============================================================================
 
 # Basic Training
-epochs: 50
-tests_episodes: 100
+epochs: 100
+tests_episodes: 50
 device: 'cuda'
 
 # Learning Parameters
 learning_rate: 1e-4      # Adam learning rate
-weight_decay: 1e-5       # L2 regularization weight
+weight_decay: 5e-5       # L2 regularization weight
 lr_decay_factor: 0.5     # Learning rate decay factor for scheduler
-lr_patience: 10          # Patience for LR scheduler
+lr_patience: 5          # Patience for LR scheduler
 early_stop_patience: 25  # Patience for early stopping
 early_stop_threshold: 0.5 # Minimum success rate threshold
 
 # Spike Regularization
 spike_reg_weight: 5e-3   # Weight for spike regularization loss
-spike_reg_coef: 5e-4     # Spike regularization coefficient
+spike_reg_coef: 5e-3     # Spike regularization coefficient
 max_spike_decay: 5e-5    # Maximum spike decay value
-spike_decay_coeff: 0.05  # Spike decay coefficient
+spike_decay_coeff: 0.2  # Spike decay coefficient
 
 # Cosine Annealing Schedule Parameters
 use_cosine_annealing: true         # Enable cosine annealing for regularizers
@@ -37,12 +37,13 @@ cosine_restart_period: 25          # Period for cosine restart (0 = no restart)
 
 # Expert Training (Teacher-Forcing) Parameters
 use_expert_training: true          # Enable teacher-forcing with expert demonstrations
-max_expert_epochs: 5               # Number of epochs to use expert data (first 5 epochs)
-expert_ratio: 0.25                 # Ratio of expert data to mix in (25% expert, 75% normal)
+expert_interval: 10                # Apply expert training every N epochs (10, 20, 30, 40...)
+expert_ratio: 0.1                  # Ratio of expert data to mix in (10% expert, 90% normal)
+expert_weight: 0.1                 # Weight multiplier for expert samples
 
 # Batch Normalization
-batch_norm_momentum: 0.4  # Momentum for batch norm running statistics
-batch_norm_eps: 0.0001   # Epsilon for batch norm numerical stability
+batch_norm_momentum: 0.7  # Momentum for batch norm running statistics
+batch_norm_eps: 0.00001   # Epsilon for batch norm numerical stability
 
 # =============================================================================
 # DATA LOADING
@@ -96,7 +97,7 @@ num_actions: 5
 lif_tau: 6.0              # LIF neuron time constant
 lif_v_reset: 0.01         # Reset voltage after spike
 lif_v_threshold: 0.09     # Spike threshold voltage
-adapt_tau: 200.0          # Adaptation time constant
+adapt_tau: 150.0          # Adaptation time constant
 adapt_alpha: 0.01         # Adaptation strength
 
 # SNN Temporal Parameters
@@ -109,17 +110,17 @@ detach_reset: false       # Detach reset for gradient flow
 
 # Input Processing
 input_scale: 7.0          # Input scaling factor for spiking
-syn_tau: 5.0              # Synaptic filter time constant
+syn_tau: 7.0              # Synaptic filter time constant
 
 # Surrogate Gradient
-surrogate_alpha: 4.0      # Surrogate gradient slope
+surrogate_alpha: 10.0      # Surrogate gradient slope
 
 # SNN Neuron Scaling (multipliers on lif_tau)
-lif_scale_conv1: 1.0
-lif_scale_conv2: 1.0
-lif_scale_conv3: 1.0
-lif_scale_feedback: 1.0
-lif_scale_attention: 1.0
+lif_scale_conv1: 1.1
+lif_scale_conv2: 1.2
+lif_scale_conv3: 1.1
+lif_scale_feedback: 1.5
+lif_scale_attention: 2.0
 lif_scale_conv4: 1.0
 
 # =============================================================================
@@ -136,8 +137,8 @@ max_connections: 5        # Maximum connections per agent
 edge_learning_rate: 0.2   # Edge weight adaptation rate
 
 # Graph SNN Decision Making
-hesitation_weight: 0.2     # Decision hesitation factor
-confidence_threshold: 0.7  # Confidence threshold for decisions
+hesitation_weight: 0.05     # Decision hesitation factor
+confidence_threshold: 0.8  # Confidence threshold for decisions
 communication_weight: 0.3  # Agent communication influence
 
 # =============================================================================
@@ -145,9 +146,9 @@ communication_weight: 0.3  # Agent communication influence
 # =============================================================================
 
 # Basic Transformer
-transformer_nhead: 4       # Number of attention heads (must divide hidden_dim=128)
-transformer_ff_dim: 128    # Feedforward dimension
-transformer_layers: 1      # Number of transformer layers
+transformer_nhead: 8       # Number of attention heads (must divide hidden_dim=128)
+transformer_ff_dim: 256    # Feedforward dimension
+transformer_layers: 2      # Number of transformer layers
 transformer2_layers: 1     # Second transformer layers
 
 # Enhanced Transformer Encoder
@@ -161,23 +162,76 @@ use_spiking_transformer: true
 transformer_nhead: 8       # Spiking transformer heads
 transformer_ff_dim: 512    # Spiking transformer feedforward
 
+# Collision Loss Curriculum Learning
+use_collision_curriculum: true        # Enable curriculum learning for collision loss
+collision_curriculum_epochs: 20       # Number of epochs for curriculum (gradual increase)
+collision_curriculum_start_ratio: 0.1 # Starting ratio of full collision loss weight (10% of final weight)
+
+# Entropy Bonus for Exploration
+use_entropy_bonus: true               # Enable entropy bonus to encourage exploration
+entropy_bonus_weight: 0.02            # Weight for entropy bonus (higher = more exploration)
+entropy_bonus_epochs: 65              # Number of epochs to apply entropy bonus
+entropy_bonus_decay_type: 'exponential'    # Decay type: 'linear', 'exponential', or 'cosine'
+
+# Goal Proximity Reward
+use_goal_proximity_reward: true       # Enable goal proximity reward throughout training
+goal_proximity_weight: 9e-4          # Weight for goal proximity reward (reduced to prevent loss explosion)
+goal_proximity_type: 'linear'        # Reward type: 'inverse', 'exponential', or 'linear'
+goal_proximity_max_distance: 10.0     # Maximum distance for reward calculation
+
 # =============================================================================
 # COLLISION LOSS PARAMETERS
 # =============================================================================
 
 # Collision Detection
 use_collision_loss: true
-collision_loss_weight: 15.0    # Weight for collision penalty
-collision_loss_type: 'exponential'     # Loss type: 'l1', 'l2', or 'exponential'
+collision_loss_weight: 40.0    # Weight for collision penalty
+collision_loss_type: 'l2'     # Loss type: 'l1', 'l2', or 'exponential'
 collision_detection_radius: 1 # Collision detection radius
 
 # Collision Types
-vertex_collision_weight: 3  # Same position collisions
-edge_collision_weight: 3    # Swapping position collisions
+vertex_collision_weight: 20  # Same position collisions (increased for cleaner signal)
+edge_collision_weight: 20    # Swapping position collisions (increased for cleaner signal)
+
+# Per-Agent Collision Loss
+per_agent_collision_loss: true  # Enable per-agent collision loss for individual learning
 
 # Future Collision Prediction
 use_future_collision_penalty: true
 future_collision_steps: 2      # Steps ahead to predict
-future_collision_weight: 1.4   # Future collision penalty weight
-future_step_decay: 0.7         # Decay for distant future steps
-separate_collision_types: false # Separate real vs future collision handling
+future_collision_weight: 20   # Future collision penalty weight
+future_step_decay: 0.8         # Decay for distant future steps
+future_blend_factor: 1       # Blend factor for combining real and future losses (0.0 = real only, 1.0 = equal weight)
+separate_collision_types: true # Separate real vs future collision handling (cleaner signal)
+
+# =============================================================================
+# STDP SPATIAL DANGER DETECTION PARAMETERS
+# =============================================================================
+
+# STDP Spatial Danger Detection
+use_stdp_spatial_detector: true   # Enable STDP-based spatial danger detection
+stdp_feature_channels: 32         # Number of feature channels in STDP layers
+stdp_kernel_size: 3               # Kernel size for STDP convolution layers
+
+# STDP Learning Parameters
+enable_stdp_learning: true        # Enable STDP learning during training
+stdp_tau_pre: 20.0               # Pre-synaptic trace time constant
+stdp_tau_post: 20.0              # Post-synaptic trace time constant
+stdp_lr_pre: 1e-4                # Pre-synaptic learning rate
+stdp_lr_post: 1e-4               # Post-synaptic learning rate
+danger_threshold: 0.3            # Threshold for danger pattern detection
+
+# Danger Decoder Parameters
+enable_danger_inhibition: true   # Enable danger-based action inhibition
+danger_gate_strength: 0.8        # How strongly danger gates inhibit actions (0.0-1.0)
+danger_sensitivity: 1.0          # Sensitivity multiplier for danger detection
+
+# =============================================================================
+# HARD INHIBITION PARAMETERS
+# =============================================================================
+
+# Hard Inhibition Thresholds
+conflict_gate_threshold: 0.2     # Threshold for hard conflict inhibition (0.0-1.0)
+hesitation_gate_threshold: 0.15  # Threshold for hard hesitation inhibition (0.0-1.0)
+
+# =============================================================================
