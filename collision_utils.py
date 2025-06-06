@@ -620,3 +620,97 @@ def compute_goal_proximity_reward(current_positions: torch.Tensor, goal_position
     # Average reward across all agents and batch
     proximity_reward = torch.mean(rewards)
     return proximity_reward
+
+
+def compute_goal_success_bonus(current_positions: torch.Tensor, goal_positions: torch.Tensor,
+                             success_threshold: float = 1.0) -> torch.Tensor:
+    """
+    Compute goal success bonus for agents that have reached their goals.
+    
+    Args:
+        current_positions: Current agent positions [batch_size, num_agents, 2] or [num_agents, 2]
+        goal_positions: Goal positions [batch_size, num_agents, 2] or [num_agents, 2]
+        success_threshold: Distance threshold to consider agent has reached goal
+        
+    Returns:
+        success_bonus: Success bonus scalar for the batch
+    """
+    # Handle both 2D and 3D tensor inputs
+    if current_positions.dim() == 2:
+        # Add batch dimension if missing [num_agents, 2] -> [1, num_agents, 2]
+        current_positions = current_positions.unsqueeze(0)
+        goal_positions = goal_positions.unsqueeze(0)
+    
+    # Compute Euclidean distances to goals
+    distances = torch.norm(current_positions - goal_positions, dim=2)  # [batch_size, num_agents]
+    
+    # Count agents that have reached their goals (distance <= threshold)
+    success_mask = distances <= success_threshold  # [batch_size, num_agents]
+    
+    # Calculate success bonus: number of successful agents normalized by total agents
+    num_successful = torch.sum(success_mask.float())
+    total_agents = torch.numel(success_mask)
+    
+    success_bonus = num_successful / total_agents if total_agents > 0 else torch.tensor(0.0, device=current_positions.device)
+    
+    return success_bonus
+
+
+def load_obstacles_from_dataset(dataset_root: str, case_indices: List[int], 
+                               mode: str = "train") -> Optional[torch.Tensor]:
+    """
+    Load obstacle positions from input.yaml files in the dataset.
+    
+    Args:
+        dataset_root: Root directory of the dataset (e.g., 'dataset/5_8_28')
+        case_indices: List of case indices to load obstacles for
+        mode: Dataset mode ('train' or 'val')
+        
+    Returns:
+        obstacles: Obstacle positions tensor [num_cases, num_obstacles, 2] or None if no obstacles
+    """
+    dataset_path = os.path.join(dataset_root, mode)
+    obstacles_list = []
+    
+    for case_idx in case_indices:
+        case_name = f"case_{case_idx}"
+        input_yaml_path = os.path.join(dataset_path, case_name, "input.yaml")
+        
+        if not os.path.exists(input_yaml_path):
+            print(f"WARNING: input.yaml not found for {case_name}, assuming no obstacles")
+            obstacles_list.append(None)
+            continue
+            
+        try:
+            with open(input_yaml_path, 'r') as f:
+                data = yaml.safe_load(f)
+                
+            map_data = data.get('map', {})
+            obstacles = map_data.get('obstacles', [])
+            
+            if obstacles:
+                # Convert obstacle positions to tensor
+                obstacle_positions = []
+                for obs in obstacles:
+                    obstacle_positions.append([float(obs[0]), float(obs[1])])
+                obstacles_tensor = torch.tensor(obstacle_positions, dtype=torch.float32)
+                obstacles_list.append(obstacles_tensor)
+            else:
+                # No obstacles in this case
+                obstacles_list.append(None)
+                
+        except Exception as e:
+            print(f"ERROR: Error loading obstacles from {input_yaml_path}: {e}")
+            obstacles_list.append(None)
+    
+    # Check if any cases have obstacles
+    valid_obstacles = [obs for obs in obstacles_list if obs is not None]
+    
+    if not valid_obstacles:
+        # No obstacles found in any case
+        return None
+    
+    # For cases with obstacles, return them; for cases without, we'll need to handle separately
+    # For now, return the obstacles from cases that have them
+    # TODO: This could be improved to handle mixed obstacle/no-obstacle cases better
+    return valid_obstacles[0] if len(valid_obstacles) == 1 else torch.stack(valid_obstacles, dim=0)
