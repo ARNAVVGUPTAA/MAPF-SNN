@@ -275,10 +275,11 @@ with open(os.path.join(results_path, "config.yaml"), "w") as config_path:
 if __name__ == "__main__":
     print("----- Training stats -----")
     if net_type == "gnn":
-        data_loader = GNNDataLoader(config)
+        # Enable obstacle conflict resolution by default
+        data_loader = GNNDataLoader(config, resolve_obstacle_conflicts=True)
     elif net_type == "snn":
-        # Initialize SNN data loader and infer channel dimensions from data
-        data_loader = SNNDataLoader(config)
+        # Initialize SNN data loader with obstacle conflict resolution enabled
+        data_loader = SNNDataLoader(config, resolve_obstacle_conflicts=True)
         # Sample first batch to get C, H, W
         batch_data = next(iter(data_loader.train_loader))
         if len(batch_data) == 4:  # With case_idx
@@ -469,10 +470,10 @@ if __name__ == "__main__":
                         initial_positions = torch.tensor(safe_positions_list, dtype=torch.float32, device=device)
                         print(f"       Generated safe positions for entire batch: shape {initial_positions.shape}")
 
-                # Load goal positions for goal proximity reward if enabled
-                use_goal_proximity_reward = config.get('use_goal_proximity_reward', False)
+                # Load goal positions for goal progress reward if enabled
+                use_goal_progress_reward = config.get('use_goal_progress_reward', False)
                 goal_positions = None
-                if use_goal_proximity_reward:
+                if use_goal_progress_reward:
                     try:
                         # Get case indices for this batch (use same cycling logic as for initial positions)
                         dataset_size = 1000  # Based on dataset analysis (cases 0-999)
@@ -499,8 +500,8 @@ if __name__ == "__main__":
                             
                     except Exception as e:
                         print(f"ERROR: [FALLBACK TRIGGERED] Failed to load goal positions: {e}")
-                        print(f"       Disabling goal proximity reward for this batch due to missing goal data")
-                        use_goal_proximity_reward = False
+                        print(f"       Disabling goal progress reward for this batch due to missing goal data")
+                        use_goal_progress_reward = False
                         goal_positions = None
 
                 # Reset and forward through time
@@ -509,11 +510,24 @@ if __name__ == "__main__":
                 real_collision_reg = 0.0  # initialize real collision regularization accumulator
                 future_collision_reg = 0.0  # initialize future collision regularization accumulator
                 entropy_bonus_reg = 0.0  # initialize entropy bonus accumulator
-                goal_proximity_reg = 0.0  # initialize goal proximity reward accumulator
+                goal_progress_reg = 0.0  # initialize goal progress reward accumulator
                 total_loss = 0.0
                 total_spikes = 0
                 total_real_collisions = 0
                 total_future_collisions = 0
+                
+                # Initialize goal state tracking for this batch
+                agents_at_goal_mask = None  # Track which agents have reached goals
+                previous_agents_at_goal = None  # Track previous timestep's goal achievement
+                
+                # Initialize best distances tracking for progress reward
+                best_distances = None  # Track best (minimum) distances achieved so far [batch_size, num_agents]
+                if use_goal_progress_reward and goal_positions is not None:
+                    # Initialize best distances to infinity (will be updated on first timestep)
+                    best_distances = torch.full_like(
+                        torch.norm(goal_positions - goal_positions, dim=2), 
+                        float('inf'), device=device
+                    )
                 
                 # Track collision loss metrics for logging
                 total_collision_loss = 0.0  # accumulated collision loss applied to training
@@ -534,10 +548,11 @@ if __name__ == "__main__":
                     decay_type = config.get('entropy_bonus_decay_type', 'linear')
                     entropy_bonus_weight = entropy_bonus_schedule(epoch, initial_entropy_weight, bonus_epochs, decay_type)
                 
-                # Get goal proximity reward weight (constant throughout training)
-                goal_proximity_weight = 0.0
-                if use_goal_proximity_reward:
-                    goal_proximity_weight = float(config.get('goal_proximity_weight', 0.05))
+                # Get goal progress reward weight (constant throughout training)
+                goal_progress_weight = 0.0
+                use_goal_progress_reward = config.get('use_goal_progress_reward', False)
+                if use_goal_progress_reward:
+                    goal_progress_weight = float(config.get('goal_progress_weight', 0.05))
                 
                 if use_collision_curriculum:
                     # Use curriculum learning for collision loss
@@ -717,8 +732,8 @@ if __name__ == "__main__":
                         # Update previous positions for next timestep
                         prev_positions = current_positions
 
-                    # Add goal proximity reward if enabled
-                    if use_goal_proximity_reward and goal_positions is not None and goal_proximity_weight > 0:
+                    # Add goal progress reward if enabled
+                    if use_goal_progress_reward and goal_positions is not None and goal_progress_weight > 0:
                         # Reconstruct current positions from trajectories (reuse if already computed)
                         if not use_collision_loss:
                             current_positions = reconstruct_positions_from_trajectories(
@@ -726,16 +741,26 @@ if __name__ == "__main__":
                                 board_size=config['board_size'][0]
                             )
                         
-                        # Compute goal proximity reward
-                        reward_type = config.get('goal_proximity_type', 'inverse')
-                        max_distance = config.get('goal_proximity_max_distance', 10.0)
-                        proximity_reward = compute_goal_proximity_reward(
-                            current_positions, goal_positions, reward_type, max_distance
+                        # Initialize best distances on first timestep
+                        if best_distances is None:
+                            # Compute initial distances to goals
+                            initial_distances = torch.norm(current_positions - goal_positions, dim=2)
+                            best_distances = initial_distances.clone()
+                        
+                        # Compute goal progress reward with best-distance tracking
+                        success_threshold = config.get('goal_success_threshold', 1.0)
+                        
+                        # Import the new function
+                        from collision_utils import compute_best_distance_progress_reward
+                        
+                        progress_reward, best_distances = compute_best_distance_progress_reward(
+                            current_positions, goal_positions, best_distances, 
+                            progress_weight=goal_progress_weight, success_threshold=success_threshold
                         )
                         
-                        # Subtract proximity reward from loss (reward reduces loss)
-                        loss -= goal_proximity_weight * proximity_reward
-                        goal_proximity_reg += float(proximity_reward.item())
+                        # Subtract progress reward from loss (reward reduces loss)
+                        loss -= progress_reward
+                        goal_progress_reg += float(progress_reward.item())
 
                     spike_reg    += float(spike_info['output_spikes'].mean().item())
                     total_spikes += int(  spike_info['output_spikes'].sum().item())
@@ -756,7 +781,7 @@ if __name__ == "__main__":
                 real_collision_reg /= T  # average real collision regularization over time
                 future_collision_reg /= T  # average future collision regularization over time
                 entropy_bonus_reg /= T  # average entropy bonus over time
-                goal_proximity_reg /= T  # average goal proximity reward over time
+                goal_progress_reg /= T  # average goal progress reward over time
                 total_collision_loss /= T  # average collision loss over time
                 total_per_agent_collision_penalties /= T  # average per-agent collision penalties over time
                 
@@ -796,12 +821,12 @@ if __name__ == "__main__":
             if entropy_bonus_weight > 0:
                 entropy_info = f" | EntropyWeight: {entropy_bonus_weight:.4f} | EntropyReg: {entropy_bonus_reg:.4f}"
             
-            # Prepare goal proximity reward info for logging
-            goal_proximity_info = ""
-            if use_goal_proximity_reward and goal_proximity_weight > 0:
-                goal_proximity_info = f" | GoalProximityWeight: {goal_proximity_weight:.4f} | GoalProximityReg: {goal_proximity_reg:.4f}"
+            # Prepare goal progress reward info for logging
+            goal_progress_info = ""
+            if use_goal_progress_reward and goal_progress_weight > 0:
+                goal_progress_info = f" | GoalProgressWeight: {goal_progress_weight:.4f} | GoalProgressReg: {goal_progress_reg:.4f}"
             
-            print(f"Epoch {epoch} | Loss: {train_loss / len(data_loader.train_loader):.4f} | LR: {current_lr:.2e} | CollisionWeight: {collision_loss_weight:.2e}{curriculum_info} | SpikeRegWeight: {spike_reg_weight:.2e}{entropy_info}{goal_proximity_info} | Spikes: {total_spikes} | SpikeReg: {spike_reg:.4f} | RealCollisionReg: {real_collision_reg:.4f} | FutureCollisionReg: {future_collision_reg:.4f} | RealCollisions: {total_real_collisions} | FutureCollisionSteps: {total_future_collisions}{expert_info}")
+            print(f"Epoch {epoch} | Loss: {train_loss / len(data_loader.train_loader):.4f} | LR: {current_lr:.2e} | CollisionWeight: {collision_loss_weight:.2e}{curriculum_info} | SpikeRegWeight: {spike_reg_weight:.2e}{entropy_info}{goal_progress_info} | Spikes: {total_spikes} | SpikeReg: {spike_reg:.4f} | RealCollisionReg: {real_collision_reg:.4f} | FutureCollisionReg: {future_collision_reg:.4f} | RealCollisions: {total_real_collisions} | FutureCollisionSteps: {total_future_collisions}{expert_info}")
             print(f"Collision Metrics - CollisionLoss: {total_collision_loss:.4f} | PerAgentPenalties: {total_per_agent_collision_penalties:.4f} | AvgCollisionLoss: {total_collision_loss / len(data_loader.train_loader):.4f}")
             print(f"Training Summary - Success Rate: {epoch_success_rate:.4f} | Avg Flow Time: {epoch_avg_flow_time:.2f} | Agents Reached: {epoch_agents_reached_goal}/{epoch_total_agents}")
         else:

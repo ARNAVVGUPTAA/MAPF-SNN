@@ -25,6 +25,12 @@ class AdaptiveLIFNode(neuron.LIFNode):
         neuron.BaseNode.reset(self)
         self.v = self.v_reset  # Reset to scalar for shape adaptation
 
+    def single_step_forward(self, x):
+        # Ensure membrane potential tensor shape matches input x
+        if not isinstance(getattr(self, 'v', None), torch.Tensor) or self.v.shape != x.shape:
+            self.v = self.v_reset * torch.ones_like(x, device=x.device)
+        return super().single_step_forward(x)
+
 
 class AttentionGate(nn.Module):
     """
@@ -36,13 +42,16 @@ class AttentionGate(nn.Module):
         self.attention_fc = nn.Linear(input_dim, input_dim)
         self.gate_fc = nn.Linear(input_dim, input_dim)
         
+        # Learnable residual connection weight
+        self.residual_weight = nn.Parameter(torch.tensor(0.5))
+        
     def forward(self, x):
         # Compute attention weights
         attention_weights = torch.sigmoid(self.attention_fc(x))
         # Compute gating values  
         gate_values = torch.tanh(self.gate_fc(x))
-        # Apply attention: element-wise multiplication
-        return x + (attention_weights * gate_values * 0.5)  # Residual + attended features
+        # Apply attention: element-wise multiplication with learnable residual weight
+        return x + (attention_weights * gate_values * self.residual_weight)  # Residual + attended features
 
 
 class DynamicGraphSNN(base.MemoryModule):
@@ -75,13 +84,22 @@ class DynamicGraphSNN(base.MemoryModule):
         self.max_connections = config.get('max_connections', 3)  # Maximum connections per agent
         self.edge_learning_rate = config.get('edge_learning_rate', 0.1)  # How fast edges adapt
         
-        # Recurrence weights for temporal dynamics
-        self.recurrence_weight = config.get('recurrence_weight', 0.3)
-        self.input_weight = config.get('input_weight', 0.7)
+        # Convert hard-coded weights to learnable parameters
+        self.recurrence_weight = nn.Parameter(torch.tensor(config.get('recurrence_weight', 0.3)))
+        self.input_weight = nn.Parameter(torch.tensor(config.get('input_weight', 0.7)))
+        self.comm_message_weight = nn.Parameter(torch.tensor(0.3))  # Learnable communication mixing weight
         
         # Hesitation parameters - controls decision confidence
         self.hesitation_weight = config.get('hesitation_weight', 0.2)
         self.confidence_threshold = config.get('confidence_threshold', 0.6)
+        
+        # Learnable gate thresholds
+        self.conflict_gate_threshold = nn.Parameter(torch.tensor(config.get('conflict_gate_threshold', 0.2)))
+        self.hesitation_gate_threshold = nn.Parameter(torch.tensor(config.get('hesitation_gate_threshold', 0.15)))
+        
+        # Learnable scaling factors
+        self.uncertainty_scale = nn.Parameter(torch.tensor(2.0))  # For hesitation input scaling
+        self.danger_scale = nn.Parameter(torch.tensor(0.3))  # For danger-aware edge boosting
         
         # Input processing with enhanced spatial attention
         self.spatial_attention = AttentionGate(input_size)
@@ -146,7 +164,10 @@ class DynamicGraphSNN(base.MemoryModule):
 
         self.output_bn = nn.BatchNorm1d(hidden_size, momentum=bn_momentum, eps=bn_eps)
         
-        # Learnable edge weights (will be updated dynamically)
+        # Learnable edge weights initialization factor
+        self.edge_init_weight = nn.Parameter(torch.tensor(0.5))
+        
+        # Initialize edge weights buffer using the learnable parameter
         self.register_buffer('edge_weights', torch.ones(num_agents, num_agents) * 0.5)
         
         # Add a buffer to store explicitly provided positions
@@ -190,12 +211,13 @@ class DynamicGraphSNN(base.MemoryModule):
         
         return proximities
         
-    def build_dynamic_adjacency_matrix(self, agent_features, batch_size, device):
+    def build_dynamic_adjacency_matrix(self, agent_features, danger_score, batch_size, device):
         """
-        Build dynamic adjacency matrix based on agent proximity and learned edge weights.
+        Build dynamic adjacency matrix based on agent proximity, learned edge weights, and danger awareness.
         
         Args:
             agent_features: [batch, num_agents, hidden_size]
+            danger_score: [batch, num_agents] - scalar danger score per agent 
             batch_size: int
             device: torch device
             
@@ -251,8 +273,13 @@ class DynamicGraphSNN(base.MemoryModule):
         else:
             edge_weights = torch.zeros(batch_size, self.num_agents, self.num_agents, device=device)
         
-        # Combine proximity and learned weights
-        combined_weights = proximities * edge_weights
+        # Danger-aware edge boosting: boost edges near dangerous agents
+        # Create pairwise danger scores: average of endpoint dangers
+        danger_pair = 0.5 * (danger_score.unsqueeze(2) + danger_score.unsqueeze(1))  # [batch, num_agents, num_agents]
+        danger_boost = self.danger_scale * danger_pair  # λ is learnable parameter
+        
+        # Combine proximity, learned weights, and danger boost
+        combined_weights = proximities * edge_weights + danger_boost
         
         # Create sparse adjacency matrix - keep only top-k connections per agent
         adj_matrix = torch.zeros_like(combined_weights)
@@ -332,13 +359,33 @@ class DynamicGraphSNN(base.MemoryModule):
         conflict_signals = self.conflict_lif(conflict_potential * self.input_scale)
         
         return conflict_signals
+    
+    def compute_danger_score(self, features):
+        """
+        Derive a scalar danger score per agent from spatial features.
         
-    def forward(self, x):
+        Args:
+            features: [batch, num_agents, feature_dim] - spatial features (STDP or hidden state)
+            
+        Returns:
+            danger_score: [batch, num_agents] - normalized danger scores in [0,1]
+        """
+        # Average across feature dimensions to get raw danger signal
+        danger_raw = features.mean(dim=-1)  # [batch, num_agents]
+        
+        # Normalize to [0,1] range using sigmoid
+        danger_score = torch.sigmoid(danger_raw)
+        
+        return danger_score
+        
+    def forward(self, x, stdp_features=None, positions=None):
         """
         Process input through dynamic graph-based localized decision making.
         
         Args:
             x: Input features [batch * num_agents, input_dim]
+            stdp_features: Optional STDP spatial features [batch * num_agents, hidden_size] for danger computation
+            positions: Optional agent positions [batch, num_agents, 2] for true spatial proximity
             
         Returns:
             output: Processed features [batch * num_agents, hidden_size]
@@ -352,6 +399,10 @@ class DynamicGraphSNN(base.MemoryModule):
         batch_size = x.size(0) // self.num_agents
         device = x.device
         
+        # Set positions if provided for true Euclidean distance computation
+        if positions is not None:
+            self.set_positions(positions)
+        
         # Apply spatial attention to input
         attended_x = self.spatial_attention(x)
         
@@ -363,8 +414,25 @@ class DynamicGraphSNN(base.MemoryModule):
         # Reshape for agent-based processing
         agent_features = input_current.view(batch_size, self.num_agents, self.hidden_size)
         
-        # Build dynamic communication graph based on current agent states
-        adj_matrix, edge_weights = self.build_dynamic_adjacency_matrix(agent_features, batch_size, device)
+        # Embed positions into node features if provided
+        if positions is not None:
+            pos_emb = torch.relu(self.position_encoder(positions))  # [batch, num_agents, hidden_size//4]
+            # Pad position embeddings to match feature dimension
+            pos_emb_padded = torch.zeros(batch_size, self.num_agents, self.hidden_size, device=device)
+            pos_emb_padded[:, :, :pos_emb.size(-1)] = pos_emb
+            # Combine input features with position embeddings
+            agent_features = agent_features + pos_emb_padded
+        
+        # Compute danger scores from STDP features if available
+        if stdp_features is not None:
+            stdp_reshaped = stdp_features.view(batch_size, self.num_agents, -1)
+            danger_score = self.compute_danger_score(stdp_reshaped)
+        else:
+            # Default: no danger boost
+            danger_score = torch.zeros(batch_size, self.num_agents, device=device)
+        
+        # Build dynamic communication graph with danger awareness
+        adj_matrix, edge_weights = self.build_dynamic_adjacency_matrix(agent_features, danger_score, batch_size, device)
         
         spike_accumulator = 0
         hidden_state = torch.zeros_like(agent_features)
@@ -375,8 +443,10 @@ class DynamicGraphSNN(base.MemoryModule):
             # Update dynamic graph structure based on current state
             if t > 0:
                 # Rebuild graph with updated agent features for adaptation
+                # Recompute danger scores from current hidden state
+                current_danger = self.compute_danger_score(hidden_state)
                 adj_matrix, edge_weights = self.build_dynamic_adjacency_matrix(
-                    hidden_state, batch_size, device
+                    hidden_state, current_danger, batch_size, device
                 )
             
             # Agent-to-agent communication with dynamic weights
@@ -407,13 +477,12 @@ class DynamicGraphSNN(base.MemoryModule):
                 recurrent_current = recurrent_current.view(batch_size, self.num_agents, self.hidden_size)
                 
                 total_current = (agent_features * self.input_weight + 
-                               comm_messages * 0.3 + 
+                               comm_messages * self.comm_message_weight + 
                                recurrent_current * self.recurrence_weight)
             
-            # Local decision making with hard conflict inhibition
-            # Hard inhibition: fully gate decisions when conflicts exceed threshold
-            conflict_threshold = float(config.get('conflict_gate_threshold', 0.2))
-            conflict_gate = (conflict_signals.mean(dim=-1, keepdim=True) > conflict_threshold).float()
+            # Local decision making with learnable conflict inhibition
+            # Use learnable threshold parameter
+            conflict_gate = (conflict_signals.mean(dim=-1, keepdim=True) > self.conflict_gate_threshold).float()
             
             # Apply hard gate: 0 = full inhibition, 1 = normal operation
             decision_input = total_current * (1.0 - conflict_gate.expand(-1, -1, self.hidden_size))
@@ -422,17 +491,16 @@ class DynamicGraphSNN(base.MemoryModule):
                 decision_input.view(-1, self.hidden_size)
             ).view(batch_size, self.num_agents, self.hidden_size)
             
-            # Enhanced hesitation mechanism with hard inhibition
+            # Enhanced hesitation mechanism with learnable uncertainty scaling
             spatial_uncertainty = torch.var(edge_weights, dim=-1, keepdim=True)  # Edge weight uncertainty
             feature_uncertainty = torch.var(total_current, dim=-1, keepdim=True)  # Feature uncertainty
             combined_uncertainty = (spatial_uncertainty + feature_uncertainty).expand(-1, -1, self.hidden_size)
             
-            hesitation_spikes = self.hesitation_lif(combined_uncertainty.view(-1, self.hidden_size) * 2.0)
+            hesitation_spikes = self.hesitation_lif(combined_uncertainty.view(-1, self.hidden_size) * self.uncertainty_scale)
             hesitation_spikes = hesitation_spikes.view(batch_size, self.num_agents, self.hidden_size)
             
-            # Apply hard hesitation gate: pause agents when uncertainty is too high
-            hesitation_threshold = float(config.get('hesitation_gate_threshold', 0.15))
-            hesitation_gate = (hesitation_spikes.mean(dim=-1, keepdim=True) > hesitation_threshold).float()
+            # Apply learnable hesitation gate threshold
+            hesitation_gate = (hesitation_spikes.mean(dim=-1, keepdim=True) > self.hesitation_gate_threshold).float()
             
             # Hard gate: 0 = full pause, 1 = normal operation  
             inhibited_decisions = local_decisions * (1.0 - hesitation_gate.expand(-1, -1, self.hidden_size))
@@ -646,6 +714,10 @@ class Network(base.MemoryModule):
         self.output_attention = AttentionGate(hidden_dim)
         self.output_fc = nn.Linear(hidden_dim, action_dim)
         
+        # Learnable scaling factors for the network
+        self.transformer_residual_weight = nn.Parameter(torch.tensor(0.5))  # For transformer output blending
+        self.output_scale = nn.Parameter(torch.tensor(2.0))  # For final output neuron scaling
+        
         # 5. Final output neuron with config parameters
         self.output_neuron = AdaptiveLIFNode(
             tau=config.get("tau_output", config.get("lif_tau", 10.0) * 0.5),  # Faster dynamics for output
@@ -683,16 +755,13 @@ class Network(base.MemoryModule):
             if positions is None and hasattr(self, 'extract_positions_from_input'):
                 positions = self.extract_positions_from_input(x)
         else:
-            # Reshape flattened input back to spatial format for STDP processing
+            # Flattened feature input: skip spatial reshape
             batch_agents = x.shape[0]
-            # Infer spatial dimensions from config
-            c = self.config.get('channels', 2)
-            h = w = int((x.shape[1] / c) ** 0.5)  # Assume square input
-            original_spatial_input = x.view(batch_agents, c, h, w)
+            original_spatial_input = None
         
-        # 0. STDP-based spatial danger detection (unsupervised learning of spatial patterns)
+        # 0. STDP-based spatial danger detection
         stdp_spatial_features = None  # Store for danger decoder
-        if self.use_stdp_spatial_detector:
+        if self.use_stdp_spatial_detector and original_spatial_input is not None:
             # Process each agent's FOV through STDP spatial danger detector
             if original_spatial_input.dim() == 5:
                 batch, agents, c, h, w = original_spatial_input.size()
@@ -724,13 +793,13 @@ class Network(base.MemoryModule):
         # Scale input to encourage spiking - use config value
         global_features = global_features * self.input_scale
         
-        # 2. Adaptive localized decision making through Dynamic Graph SNN
-        snn_output = self.snn_block(global_features)
+        # 2. Adaptive localized decision making through Dynamic Graph SNN with danger awareness
+        snn_output = self.snn_block(global_features, stdp_features=stdp_spatial_features, positions=positions)
         
         # 3. Optional enhanced attention through Spiking Transformer
         if self.use_spiking_transformer:
             transformer_output = self.spiking_transformer(snn_output)
-            snn_output = snn_output + transformer_output * 0.5  # Residual connection
+            snn_output = snn_output + transformer_output * self.transformer_residual_weight  # Learnable residual connection
         
         # 4. Output attention for action selection focus
         attended_output = self.output_attention(snn_output)
@@ -744,8 +813,8 @@ class Network(base.MemoryModule):
             # Apply danger gating to inhibit risky actions based on STDP-learned spatial patterns
             action_logits, danger_info = self.danger_decoder(stdp_spatial_features, action_logits)
         
-        # 7. Final spiking output (rate-coded action values)
-        output_spikes = self.output_neuron(action_logits * 2.0)  # Aggressive scaling for output spikes
+        # 7. Final spiking output with learnable scaling
+        output_spikes = self.output_neuron(action_logits * self.output_scale)  # Learnable scaling for output spikes
         
         # Ensure output shape is correct
         if output_spikes.dim() != 2 or output_spikes.shape[-1] != self.num_classes:
@@ -827,6 +896,12 @@ class SpikingTransformer(base.MemoryModule):
         # Ensure d_model is divisible by nhead
         assert d_model % nhead == 0, f"d_model {d_model} must be divisible by nhead {nhead}"
         
+        # Learnable scaling factors for LIF neurons
+        self.attn_tau_scale = nn.Parameter(torch.tensor(0.5))  # Faster for attention
+        self.attn_threshold_scale = nn.Parameter(torch.tensor(0.7))  # Lower threshold
+        self.ff_input_scale = nn.Parameter(torch.tensor(config.get('input_scale', 2.0)))  # Input scaling for FF
+        self.attn_input_scale = nn.Parameter(torch.tensor(config.get('input_scale', 2.0)))  # Input scaling for attention
+        
         # Query, Key, Value projections
         self.q_proj = nn.Linear(d_model, d_model)
         self.k_proj = nn.Linear(d_model, d_model)
@@ -838,8 +913,8 @@ class SpikingTransformer(base.MemoryModule):
         
         # Spiking neurons for attention processing
         self.attn_lif = AdaptiveLIFNode(
-            tau=config.get('lif_tau', 10.0) * 0.5,  # Faster for attention
-            v_threshold=config.get('lif_v_threshold', 0.5) * 0.7,  # Lower threshold
+            tau=config.get('lif_tau', 10.0) * 0.5,  # Use fixed values initially  
+            v_threshold=config.get('lif_v_threshold', 0.5) * 0.7,
             v_reset=config.get('lif_v_reset', 0.0)
         )
         
@@ -859,12 +934,22 @@ class SpikingTransformer(base.MemoryModule):
         # Layer normalization
         self.norm1 = nn.LayerNorm(d_model)
         self.norm2 = nn.LayerNorm(d_model)
+
+    def _update_lif_parameters(self):
+        """Update LIF neuron parameters based on learnable scaling factors"""
+        base_tau = config.get('lif_tau', 10.0)
+        base_threshold = config.get('lif_v_threshold', 0.5)
+        self.attn_lif.tau = base_tau * self.attn_tau_scale
+        self.attn_lif.v_threshold = base_threshold * self.attn_threshold_scale
         
     def forward(self, x):
         """
         Simple spiking self-attention.
         x: [batch_size, seq_len, d_model] or [batch_size, d_model] for single token
         """
+        # Update LIF parameters with current learnable values
+        self._update_lif_parameters()
+        
         # Handle single token case
         if x.dim() == 2:
             x = x.unsqueeze(1)  # [batch, 1, d_model]
@@ -904,13 +989,13 @@ class SpikingTransformer(base.MemoryModule):
         attn_output = self.out_proj_bn(attn_output)  # Apply batch norm
         attn_output = attn_output.view(batch_size, seq_len, d_model)
         
-        # Pass through spiking neuron and add residual
-        spiking_attn = self.attn_lif(attn_output * config.get('input_scale', 2.0))
+        # Pass through spiking neuron and add residual with learnable scaling
+        spiking_attn = self.attn_lif(attn_output * self.attn_input_scale)
         x = x + spiking_attn
         
-        # Feedforward with residual connection
+        # Feedforward with residual connection and learnable scaling
         ff_input = self.norm2(x)
-        ff_output = self.ff_network(ff_input.view(-1, d_model) * config.get('input_scale', 2.0))
+        ff_output = self.ff_network(ff_input.view(-1, d_model) * self.ff_input_scale)
         ff_output = ff_output.view(batch_size, seq_len, d_model)
         x = x + ff_output
         
@@ -952,23 +1037,34 @@ class STDPSpatialDangerDetector(base.MemoryModule):
         self.learning_rate_post = float(cfg.get('stdp_lr_post', 1e-4)) if cfg else 1e-4
         self.stdp_enabled = bool(cfg.get('enable_stdp_learning', True)) if cfg else True
         
+        # Learnable scaling factors for LIF neurons
+        self.tau_scale_1 = nn.Parameter(torch.tensor(0.8))  # For spatial detection speed
+        self.tau_scale_2 = nn.Parameter(torch.tensor(0.8))
+        self.threshold_scale_1 = nn.Parameter(torch.tensor(0.7))  # For sensitivity
+        self.threshold_scale_2 = nn.Parameter(torch.tensor(0.7))
+        
         # Spatial feature extraction layers
         self.conv1 = nn.Conv2d(input_channels, feature_channels, kernel_size=kernel_size, 
                               padding=kernel_size//2, bias=False)
         self.conv2 = nn.Conv2d(feature_channels, feature_channels, kernel_size=kernel_size, 
                               padding=kernel_size//2, bias=False)
         
-        # Spiking neurons for each conv layer
+        # Store base parameters for dynamic LIF configuration
+        self.base_tau = (cfg.get('lif_tau', 10.0) if cfg else 10.0)
+        self.base_threshold = (cfg.get('lif_v_threshold', 0.5) if cfg else 0.5)
+        self.base_reset = cfg.get('lif_v_reset', 0.0) if cfg else 0.0
+        
+        # Spiking neurons for each conv layer - will be dynamically configured
         self.sn1 = AdaptiveLIFNode(
-            tau=(cfg.get('lif_tau', 10.0) if cfg else 10.0) * 0.8,  # Slightly faster for spatial detection
-            v_threshold=(cfg.get('lif_v_threshold', 0.5) if cfg else 0.5) * 0.7,  # Lower threshold for better sensitivity
-            v_reset=cfg.get('lif_v_reset', 0.0) if cfg else 0.0
+            tau=self.base_tau * 0.8,  # Use fixed values initially
+            v_threshold=self.base_threshold * 0.7,
+            v_reset=self.base_reset
         )
         
         self.sn2 = AdaptiveLIFNode(
-            tau=(cfg.get('lif_tau', 10.0) if cfg else 10.0) * 0.8,
-            v_threshold=(cfg.get('lif_v_threshold', 0.5) if cfg else 0.5) * 0.7,
-            v_reset=cfg.get('lif_v_reset', 0.0) if cfg else 0.0
+            tau=self.base_tau * 0.8,
+            v_threshold=self.base_threshold * 0.7,
+            v_reset=self.base_reset
         )
         
         # Initialize STDP learners for unsupervised learning
@@ -1005,6 +1101,14 @@ class STDPSpatialDangerDetector(base.MemoryModule):
         
         # Adaptive pooling to provide consistent output size
         self.adaptive_pool = nn.AdaptiveAvgPool2d((9, 9))  # Match expected FOV size
+
+    def _update_lif_parameters(self):
+        """Update LIF neuron parameters based on learnable scaling factors"""
+        # Update tau and threshold dynamically using learnable parameters
+        self.sn1.tau = self.base_tau * self.tau_scale_1
+        self.sn1.v_threshold = self.base_threshold * self.threshold_scale_1
+        self.sn2.tau = self.base_tau * self.tau_scale_2
+        self.sn2.v_threshold = self.base_threshold * self.threshold_scale_2
         
     def forward(self, x):
         """
@@ -1016,6 +1120,9 @@ class STDPSpatialDangerDetector(base.MemoryModule):
         Returns:
             Enhanced spatial features with learned danger patterns
         """
+        # Update LIF parameters with current learnable values
+        self._update_lif_parameters()
+        
         # Reset spiking neurons
         self.sn1.reset()
         self.sn2.reset()

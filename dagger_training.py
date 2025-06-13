@@ -664,6 +664,10 @@ class DAggerTrainer:
             sum_goal_success_bonus = 0.0
             # Initialize spike counts
             spike_counts = {'output_spikes': 0, 'stage1_output': 0, 'stage2_output': 0, 'stage3_output': 0}
+            
+            # Initialize goal state tracking for this epoch
+            agents_at_goal_mask = None  # Track which agents have reached goals
+            previous_agents_at_goal = None  # Track previous batch's goal achievement
              
             for batch_fovs, batch_targets, batch_case_indices in train_dataloader:
                 batch_fovs = batch_fovs.to(self.device)
@@ -901,14 +905,22 @@ class DAggerTrainer:
                             dummy_goal_positions_tensor = torch.stack(dummy_goal_positions_list, dim=0).to(self.device)
                             goal_positions = torch.cat([goal_positions, dummy_goal_positions_tensor], dim=0)
                         
-                        # Compute actual goal proximity reward
+                        # Compute goal proximity reward with state tracking
                         reward_type = self.config.get('goal_proximity_type', 'exponential')
                         max_distance = self.config.get('goal_proximity_max_distance', 10.0)
+                        success_threshold = self.config.get('goal_success_threshold', 1.0)
+                        
+                        # Import the enhanced function
+                        from collision_utils import compute_goal_proximity_reward
+                        
                         prox_reward = compute_goal_proximity_reward(
-                            current_positions, goal_positions, reward_type, max_distance
+                            current_positions, goal_positions, reward_type, max_distance, success_threshold, track_progress=True
                         )
                         loss -= goal_proximity_weight * prox_reward  # Subtract to encourage goal-seeking
                         sum_goal_prox_reward += (goal_proximity_weight * prox_reward).item()
+                        
+                        # Update previous agents at goal for next batch
+                        previous_agents_at_goal = agents_at_goal_mask.clone() if agents_at_goal_mask is not None else None
                     except Exception as e:
                         # Fallback to 0.0 if goal loading fails
                         prox_reward = 0.0
@@ -965,13 +977,21 @@ class DAggerTrainer:
                             # goal_positions already loaded from proximity calculation
                             pass
                         
-                        # Compute actual goal success bonus
+                        # Compute goal success bonus with state tracking
                         success_threshold = self.config.get('goal_success_threshold', 1.0)
-                        success_bonus = compute_goal_success_bonus(
-                            current_positions, goal_positions, success_threshold
+                        
+                        # Import the new function  
+                        from collision_utils import compute_goal_success_bonus_with_state_tracking
+                        
+                        success_bonus, current_agents_at_goal = compute_goal_success_bonus_with_state_tracking(
+                            current_positions, goal_positions, success_threshold, previous_agents_at_goal
                         )
                         loss -= goal_success_weight * success_bonus  # Subtract to reward goal achievement
                         sum_goal_success_bonus += (goal_success_weight * success_bonus).item()
+                        
+                        # Update goal state tracking
+                        agents_at_goal_mask = current_agents_at_goal
+                        previous_agents_at_goal = agents_at_goal_mask.clone() if agents_at_goal_mask is not None else None
                     except Exception as e:
                         # Fallback to 0.0 if goal loading fails
                         success_bonus = 0.0

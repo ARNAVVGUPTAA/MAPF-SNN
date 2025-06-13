@@ -13,12 +13,12 @@ net_type: 'snn'
 # Basic Training
 epochs: 100
 tests_episodes: 50
-device: 'cuda'
+device: 'cpu'           # Changed from 'cuda' to 'cpu' since no NVIDIA GPU available
 
 # Learning Parameters
 learning_rate: 1e-4      # Adam learning rate
 weight_decay: 5e-5       # L2 regularization weight
-lr_decay_factor: 0.5     # Learning rate decay factor for scheduler
+lr_decay_factor: 0.5     # Learning rate decay factor for scheduler   
 lr_patience: 5          # Patience for LR scheduler
 early_stop_patience: 25  # Patience for early stopping
 early_stop_threshold: 0.5 # Minimum success rate threshold
@@ -76,7 +76,7 @@ batch_size: 128
 # =============================================================================
 
 # Simulation Environment
-board_size: [28, 28]
+board_size: [9, 9]
 map_shape: [9, 9]
 num_agents: 5
 obstacles: 5
@@ -169,15 +169,14 @@ collision_curriculum_start_ratio: 0.1 # Starting ratio of full collision loss we
 
 # Entropy Bonus for Exploration
 use_entropy_bonus: true               # Enable entropy bonus to encourage exploration
-entropy_bonus_weight: 0.02            # Weight for entropy bonus (higher = more exploration)
-entropy_bonus_epochs: 65              # Number of epochs to apply entropy bonus
-entropy_bonus_decay_type: 'exponential'    # Decay type: 'linear', 'exponential', or 'cosine'
+entropy_bonus_weight: 0.15            # Weight for entropy bonus (higher = more exploration) - INCREASED for more exploration
+entropy_bonus_epochs: 80              # Number of epochs to apply entropy bonus - EXTENDED for longer exploration
+entropy_bonus_decay_type: 'cosine'    # Decay type: 'linear', 'exponential', or 'cosine' - CHANGED to cosine for smoother decay
 
-# Goal Proximity Reward
-use_goal_proximity_reward: true       # Enable goal proximity reward throughout training
-goal_proximity_weight: 9e-4          # Weight for goal proximity reward (reduced to prevent loss explosion)
-goal_proximity_type: 'linear'        # Reward type: 'inverse', 'exponential', or 'linear'
-goal_proximity_max_distance: 10.0     # Maximum distance for reward calculation
+# Goal Progress Reward (Best-Distance-So-Far System)
+use_goal_progress_reward: true        # Enable goal progress reward - rewards only new progress towards goals
+goal_progress_weight: 9e-4           # Weight for goal progress reward (same as old proximity weight)
+goal_success_threshold: 1.0          # Distance threshold to consider agent has reached goal
 
 # =============================================================================
 # COLLISION LOSS PARAMETERS

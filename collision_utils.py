@@ -584,15 +584,21 @@ def load_goal_positions_from_dataset(dataset_root: str, case_indices: List[int],
 
 
 def compute_goal_proximity_reward(current_positions: torch.Tensor, goal_positions: torch.Tensor,
-                                 reward_type: str = 'inverse', max_distance: float = 10.0) -> torch.Tensor:
+                                 reward_type: str = 'inverse', max_distance: float = 10.0,
+                                 success_threshold: float = 1.0, track_progress: bool = True,
+                                 previous_positions: torch.Tensor = None) -> torch.Tensor:
     """
-    Compute goal proximity reward based on distance to goal positions.
+    Compute goal proximity reward based on distance to goal positions with progress tracking.
+    Only rewards agents that are moving toward their goals, not away from them.
     
     Args:
         current_positions: Current agent positions [batch_size, num_agents, 2]
         goal_positions: Goal positions [batch_size, num_agents, 2]
         reward_type: Type of reward computation ('inverse', 'exponential', 'linear')
         max_distance: Maximum distance for reward normalization
+        success_threshold: Distance threshold to consider agent has reached goal (used when track_progress=True)
+        track_progress: If True, only reward agents that haven't reached their goals yet
+        previous_positions: Previous agent positions [batch_size, num_agents, 2] for movement direction tracking
         
     Returns:
         proximity_reward: Proximity reward scalar for the batch
@@ -600,24 +606,52 @@ def compute_goal_proximity_reward(current_positions: torch.Tensor, goal_position
     # Compute Euclidean distances to goals
     distances = torch.norm(current_positions - goal_positions, dim=2)  # [batch_size, num_agents]
     
+    # Create base mask for eligible agents
+    eligible_agents_mask = torch.ones_like(distances, dtype=torch.bool)
+    
+    # Apply progress tracking if enabled
+    if track_progress:
+        # Identify agents that have reached their goals
+        agents_at_goal_mask = distances <= success_threshold  # [batch_size, num_agents]
+        # Create mask for agents that still need to reach goals
+        eligible_agents_mask = ~agents_at_goal_mask  # [batch_size, num_agents]
+    
+    # Apply movement direction filter if previous positions are provided
+    if previous_positions is not None:
+        # Compute previous distances to goals
+        prev_distances = torch.norm(previous_positions - goal_positions, dim=2)  # [batch_size, num_agents]
+        
+        # Only reward agents that are moving closer to their goals (distance decreased)
+        moving_toward_goal_mask = distances < prev_distances  # [batch_size, num_agents]
+        
+        # Combine with existing eligibility mask
+        eligible_agents_mask = eligible_agents_mask & moving_toward_goal_mask
+    
+    # Get distances for eligible agents only
+    if torch.any(eligible_agents_mask):
+        active_distances = distances[eligible_agents_mask]
+    else:
+        # No eligible agents (all at goals or moving away), return zero reward as scalar tensor
+        return torch.tensor(0.0, device=current_positions.device, dtype=torch.float32)
+    
     if reward_type == 'inverse':
         # Inverse distance reward: closer = higher reward
         # Add small epsilon to avoid division by zero and clamp to reasonable range
         epsilon = 1e-6
-        rewards = 1.0 / (distances + epsilon)
+        rewards = 1.0 / (active_distances + epsilon)
         # Clamp rewards to prevent extreme values
         rewards = torch.clamp(rewards, max=10.0)  # Cap at 10 to prevent loss explosion
     elif reward_type == 'exponential':
         # Exponential decay reward: exp(-distance/scale)
         scale = max_distance / 3.0  # Scale factor for exponential decay
-        rewards = torch.exp(-distances / scale)
+        rewards = torch.exp(-active_distances / scale)
     elif reward_type == 'linear':
         # Linear reward: (max_distance - distance) / max_distance
-        rewards = torch.clamp((max_distance - distances) / max_distance, min=0.0)
+        rewards = torch.clamp((max_distance - active_distances) / max_distance, min=0.0)
     else:
         raise ValueError(f"Unknown reward_type: {reward_type}")
     
-    # Average reward across all agents and batch
+    # Average reward across selected agents
     proximity_reward = torch.mean(rewards)
     return proximity_reward
 
@@ -654,6 +688,54 @@ def compute_goal_success_bonus(current_positions: torch.Tensor, goal_positions: 
     success_bonus = num_successful / total_agents if total_agents > 0 else torch.tensor(0.0, device=current_positions.device)
     
     return success_bonus
+
+
+def compute_goal_success_bonus_with_state_tracking(current_positions: torch.Tensor, 
+                                                  goal_positions: torch.Tensor,
+                                                  success_threshold: float = 1.0,
+                                                  previous_agents_at_goal: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Compute goal success bonus with state tracking to reward only newly successful agents.
+    
+    Args:
+        current_positions: Current agent positions [batch_size, num_agents, 2] or [num_agents, 2]
+        goal_positions: Goal positions [batch_size, num_agents, 2] or [num_agents, 2] 
+        success_threshold: Distance threshold to consider agent has reached goal
+        previous_agents_at_goal: Previous timestep's goal achievement mask [batch_size, num_agents]
+        
+    Returns:
+        Tuple of (success_bonus, agents_at_goal_mask)
+        - success_bonus: Success bonus for newly successful agents only
+        - agents_at_goal_mask: Current goal achievement mask [batch_size, num_agents]
+    """
+    # Handle both 2D and 3D tensor inputs
+    if current_positions.dim() == 2:
+        current_positions = current_positions.unsqueeze(0)
+        goal_positions = goal_positions.unsqueeze(0)
+        if previous_agents_at_goal is not None and previous_agents_at_goal.dim() == 1:
+            previous_agents_at_goal = previous_agents_at_goal.unsqueeze(0)
+    
+    # Compute Euclidean distances to goals
+    distances = torch.norm(current_positions - goal_positions, dim=2)  # [batch_size, num_agents]
+    
+    # Current agents that have reached their goals
+    current_agents_at_goal = distances <= success_threshold  # [batch_size, num_agents]
+    
+    if previous_agents_at_goal is not None:
+        # Only reward newly successful agents (reached goal this timestep)
+        newly_successful = current_agents_at_goal & (~previous_agents_at_goal)
+        num_newly_successful = torch.sum(newly_successful.float())
+        total_agents = torch.numel(current_agents_at_goal)
+        
+        success_bonus = num_newly_successful / total_agents if total_agents > 0 else torch.tensor(0.0, device=current_positions.device)
+    else:
+        # First timestep or no previous state: reward all currently successful agents
+        num_successful = torch.sum(current_agents_at_goal.float())
+        total_agents = torch.numel(current_agents_at_goal)
+        
+        success_bonus = num_successful / total_agents if total_agents > 0 else torch.tensor(0.0, device=current_positions.device)
+    
+    return success_bonus, current_agents_at_goal
 
 
 def load_obstacles_from_dataset(dataset_root: str, case_indices: List[int], 
@@ -714,3 +796,77 @@ def load_obstacles_from_dataset(dataset_root: str, case_indices: List[int],
     # For now, return the obstacles from cases that have them
     # TODO: This could be improved to handle mixed obstacle/no-obstacle cases better
     return valid_obstacles[0] if len(valid_obstacles) == 1 else torch.stack(valid_obstacles, dim=0)
+
+def compute_best_distance_progress_reward(current_positions: torch.Tensor, goal_positions: torch.Tensor,
+                                         best_distances: torch.Tensor,
+                                         progress_weight: float = 1.0, success_threshold: float = 1.0) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Compute progress reward based on "best-distance-so-far" system.
+    Only rewards agents when they achieve a new best (minimum) distance to their goal.
+    Idle behavior (no progress) receives neutral reward (0).
+    
+    Args:
+        current_positions: Current agent positions [batch_size, num_agents, 2] or [num_agents, 2]
+        goal_positions: Goal positions [batch_size, num_agents, 2] or [num_agents, 2]
+        best_distances: Current best distances achieved so far [batch_size, num_agents] or [num_agents]
+        progress_weight: Weight for progress reward scaling
+        success_threshold: Distance threshold to consider agent has reached goal
+        
+    Returns:
+        Tuple of (progress_reward, updated_best_distances)
+        - progress_reward: Progress reward scalar for the batch
+        - updated_best_distances: Updated best distances [batch_size, num_agents] or [num_agents]
+    """
+    # Handle both 2D and 3D tensor inputs
+    if current_positions.dim() == 2:
+        # Add batch dimension if missing [num_agents, 2] -> [1, num_agents, 2]
+        current_positions = current_positions.unsqueeze(0)
+        goal_positions = goal_positions.unsqueeze(0)
+        best_distances = best_distances.unsqueeze(0)
+        squeeze_output = True
+    else:
+        squeeze_output = False
+    
+    # Compute current distances to goals
+    current_distances = torch.norm(current_positions - goal_positions, dim=2)  # [batch_size, num_agents]
+    
+    # Handle first timestep: initialize best_distances if they are inf
+    is_first_timestep = torch.isinf(best_distances)
+    initial_best_distances = torch.where(is_first_timestep, current_distances, best_distances)
+    
+    # Find agents that achieved new best (lower) distances (but not on first timestep)
+    progress_mask = (current_distances < initial_best_distances) & (~is_first_timestep)  # [batch_size, num_agents]
+    
+    # Exclude agents that have already reached their goals from progress rewards
+    agents_at_goal_mask = current_distances <= success_threshold  # [batch_size, num_agents]
+    eligible_progress_mask = progress_mask & (~agents_at_goal_mask)  # [batch_size, num_agents]
+    
+    # Update best distances: use current distance if it's better, or if this is first timestep
+    updated_best_distances = torch.where(
+        (current_distances < initial_best_distances) | is_first_timestep, 
+        current_distances, 
+        initial_best_distances
+    )
+    
+    # Calculate progress reward only for eligible agents
+    if torch.any(eligible_progress_mask):
+        # Compute progress amount for eligible agents
+        progress_amounts = initial_best_distances[eligible_progress_mask] - current_distances[eligible_progress_mask]
+        
+        # Clamp progress amounts to avoid inf values (should not happen but safety check)
+        progress_amounts = torch.clamp(progress_amounts, max=100.0)  # Max reasonable progress per step
+        
+        # Scale progress by progress weight
+        scaled_progress = progress_amounts * progress_weight
+        
+        # Sum progress reward across progressing agents only (not averaged by total agents)
+        progress_reward = torch.sum(scaled_progress)
+    else:
+        # No agents made progress, return zero reward
+        progress_reward = torch.tensor(0.0, device=current_positions.device, dtype=torch.float32)
+    
+    # Remove batch dimension if input was 2D
+    if squeeze_output:
+        updated_best_distances = updated_best_distances.squeeze(0)
+    
+    return progress_reward, updated_best_distances

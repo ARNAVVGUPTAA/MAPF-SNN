@@ -51,21 +51,89 @@ def gen_input(dimensions: tuple[int, int], nb_obs: int, nb_agents: int) -> dict:
                 good = True
         return ag_goal
 
+    # Generate initial obstacles
     for obstacle in range(nb_obs):
         obstacle = assign_obstacle(obstacles)
         obstacles.append(obstacle)
-        input_dict["map"]["obstacles"].append(tuple(obstacle))
 
+    # Generate agent starts and goals
     for agent in range(nb_agents):
         start = assign_start(starts, obstacles)
         starts.append(start)
         goal = assign_goal(goals, obstacles)
         goals.append(goal)
+
+    # Apply obstacle conflict resolution
+    obstacles = _resolve_obstacle_conflicts_for_generation(
+        obstacles, starts, goals, dimensions
+    )
+
+    # Update input dict with resolved obstacles
+    input_dict["map"]["obstacles"] = [tuple(obs) for obs in obstacles]
+    
+    for agent in range(nb_agents):
         input_dict["agents"].append(
-            {"start": start, "goal": goal, "name": f"agent{agent}"}
+            {"start": starts[agent], "goal": goals[agent], "name": f"agent{agent}"}
         )
 
     return input_dict
+
+
+def _resolve_obstacle_conflicts_for_generation(obstacles, agent_positions, goal_positions, dimensions):
+    """
+    Resolve conflicts between obstacles and agent positions/goals during data generation.
+    This is similar to the enhanced_train.py version but adapted for the generation pipeline.
+    """
+    if not obstacles:
+        return obstacles
+        
+    # Convert positions to sets for faster lookup
+    occupied_positions = set()
+    for pos in agent_positions + goal_positions:
+        occupied_positions.add(tuple(pos))
+    
+    resolved_obstacles = []
+    
+    for obs in obstacles:
+        obs_tuple = tuple(obs)
+        
+        # Check if obstacle conflicts with any agent position or goal
+        if obs_tuple in occupied_positions:
+            # Find a free space for this obstacle
+            new_obs = _find_free_space_for_generation(occupied_positions, dimensions)
+            if new_obs is not None:
+                resolved_obstacles.append(new_obs)
+                occupied_positions.add(tuple(new_obs))
+            # If no free space found, skip this obstacle
+        else:
+            # No conflict, keep original obstacle
+            resolved_obstacles.append(obs)
+            occupied_positions.add(obs_tuple)
+    
+    return resolved_obstacles
+
+
+def _find_free_space_for_generation(occupied_positions, dimensions, max_attempts=100):
+    """
+    Find a free space on the grid for obstacle relocation during data generation.
+    """
+    width, height = dimensions
+    
+    # Random search first (faster for sparse grids)
+    for _ in range(max_attempts):
+        x = np.random.randint(0, width)
+        y = np.random.randint(0, height)
+        if (x, y) not in occupied_positions:
+            return [x, y]
+    
+    # Systematic search if random fails
+    for x in range(width):
+        for y in range(height):
+            if (x, y) not in occupied_positions:
+                return [x, y]
+    
+    # No free space found
+    return None
 
 
 def cbs_search_worker(env, result_queue):
