@@ -323,7 +323,7 @@ def torch_unique_consecutive_test(agent_positions: torch.Tensor, num_agents: int
         bool: True if constraint is satisfied
     """
     # Flatten positions and check uniqueness
-    flat_positions = agent_positions.view(-1, 2)
+    flat_positions = agent_positions.reshape(-1, 2)
     unique_positions = torch.unique(flat_positions, dim=0)
     
     expected_unique = agent_positions.shape[0] * num_agents

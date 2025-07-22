@@ -141,9 +141,9 @@ class Network(nn.Module):
         for id_agent in range(self.num_agents):
             agent_state = states[:, id_agent, :, :, :]
             features = self.convLayers(agent_state)
-            features_flatten = features.view(features.size(0), -1)  # B x T*C*W*H
+            features_flatten = features.reshape(features.size(0), -1)  # B x T*C*W*H
             encoded_feats = self.compressMLP(features_flatten)
-            encoded_feats_flat = encoded_feats.view(encoded_feats.size(0), -1)
+            encoded_feats_flat = encoded_feats.reshape(encoded_feats.size(0), -1)
             feature_vector[:, :, id_agent] = encoded_feats_flat  # B x F x N
 
         for layer in range(self.nb_filter):

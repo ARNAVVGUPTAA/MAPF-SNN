@@ -2,7 +2,15 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
-from spikingjelly.activation_based import neuron, surrogate, layer, functional
+from spikingjelly.activation_based import neuron, su        self.fc1 = nn.Sequential(
+            layer.Linear(input_size, 256),
+            nn.BatchNorm1d(256, momentum=bn_momentum, eps=bn_eps),
+            RecurrentLIFNode(
+                tau=cfg.get('lif_tau', 10.0),
+                v_threshold=cfg.get('lif_v_threshold', 2.0),
+                v_reset=cfg.get('lif_v_reset', 0.0)
+            )
+        )layer, functional
 from spikingjelly.activation_based.layer import SynapseFilter, LinearRecurrentContainer
 from config import config
 
@@ -18,7 +26,7 @@ class RecurrentLIFNode(neuron.BaseNode):
         super().__init__(surrogate_function=surrogate.Sigmoid(alpha=alpha), detach_reset=detach_reset)
         self.tau = config.get('lif_tau', tau) if tau is None else tau
         self.v_reset = config.get('lif_v_reset', v_reset)
-        self.v_threshold = config.get('lif_v_threshold', v_threshold)
+        self.v_threshold = config.get('lif_v_threshold', 2.0)
         self.register_memory('mem', None)  # ⚡ Maintain state across time steps
         self.register_memory('spike', None)
 

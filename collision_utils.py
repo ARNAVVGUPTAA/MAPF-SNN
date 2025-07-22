@@ -117,7 +117,7 @@ def compute_per_agent_collision_losses(logits: torch.Tensor,
     device = immediate_penalty.device
     
     # Reshape penalty to match logits shape [batch * num_agents]
-    penalty_flat = immediate_penalty.view(-1)  # [batch * num_agents]
+    penalty_flat = immediate_penalty.reshape(-1)  # [batch * num_agents]
     
     # Compute loss based on collision type
     collision_loss_type = collision_config.get('collision_loss_type', 'l2')
@@ -140,6 +140,7 @@ def compute_collision_loss(logits: torch.Tensor,
                           collision_config: Dict = None) -> Tuple[torch.Tensor, Dict]:
     """
     Compute collision loss to penalize actions that lead to collisions.
+    Uses continuous inverse Manhattan distance for smooth gradients.
     
     Args:
         logits: Action logits [batch * num_agents, num_actions]
@@ -152,29 +153,33 @@ def compute_collision_loss(logits: torch.Tensor,
     """
     if collision_config is None:
         collision_config = {
-            'vertex_collision_weight': 1.0,
-            'edge_collision_weight': 0.5,
+            'vertex_collision_weight': 5.0,  # Increased from 1.0 for balance
+            'edge_collision_weight': 3.0,    # Increased from 0.5 for balance
             'collision_loss_type': 'l2',
             'use_future_collision_penalty': False,
             'future_collision_steps': 2,
             'future_collision_weight': 0.8,
             'future_step_decay': 0.7,
-            'separate_collision_types': True,  # New flag to handle collisions separately
-            'per_agent_loss': True  # New flag to compute per-agent losses
+            'separate_collision_types': True,
+            'per_agent_loss': True,
+            'collision_threshold': 2.0,  # Distance threshold for collision penalty
+            'use_continuous_collision': True  # Use continuous inverse distance
         }
-    
-    # Detect immediate collisions
-    collisions = detect_collisions(positions, prev_positions)
     
     batch_size, num_agents = positions.shape[:2]
     device = positions.device
     
-    # Compute immediate collision penalties
-    vertex_penalty = collisions['vertex_collisions'] * collision_config['vertex_collision_weight']
-    edge_penalty = collisions['edge_collisions'] * collision_config['edge_collision_weight']
-    
-    # Total immediate collision penalty per agent
-    immediate_penalty = vertex_penalty + edge_penalty  # [batch, num_agents]
+    # Use continuous collision loss for better gradients
+    if collision_config.get('use_continuous_collision', True):
+        collision_penalty = compute_continuous_collision_penalty(
+            positions, collision_config
+        )
+    else:
+        # Fallback to binary collision detection
+        collisions = detect_collisions(positions, prev_positions)
+        vertex_penalty = collisions['vertex_collisions'] * collision_config['vertex_collision_weight']
+        edge_penalty = collisions['edge_collisions'] * collision_config['edge_collision_weight']
+        collision_penalty = vertex_penalty + edge_penalty
     
     # Check if we should compute per-agent losses
     use_per_agent_loss = collision_config.get('per_agent_loss', True)
@@ -182,18 +187,18 @@ def compute_collision_loss(logits: torch.Tensor,
     if use_per_agent_loss:
         # Compute per-agent collision losses that can be applied to individual agent predictions
         per_agent_collision_losses = compute_per_agent_collision_losses(
-            logits, immediate_penalty, collision_config
+            logits, collision_penalty, collision_config
         )
         
         # Also compute aggregate statistics for logging
         if collision_config['collision_loss_type'] == 'l1':
-            aggregate_collision_loss = torch.mean(immediate_penalty)
+            aggregate_collision_loss = torch.mean(collision_penalty)
         elif collision_config['collision_loss_type'] == 'l2':
-            aggregate_collision_loss = torch.mean(immediate_penalty ** 2)
+            aggregate_collision_loss = torch.mean(collision_penalty ** 2)
         elif collision_config['collision_loss_type'] == 'exponential':
-            aggregate_collision_loss = torch.mean(torch.exp(immediate_penalty) - 1)
+            aggregate_collision_loss = torch.mean(torch.exp(collision_penalty) - 1)
         else:
-            aggregate_collision_loss = torch.mean(immediate_penalty)
+            aggregate_collision_loss = torch.mean(collision_penalty)
         
         total_collision_loss = per_agent_collision_losses
         real_collision_loss = aggregate_collision_loss
@@ -205,13 +210,13 @@ def compute_collision_loss(logits: torch.Tensor,
         
         # Compute real collision loss
         if collision_config['collision_loss_type'] == 'l1':
-            real_collision_loss = torch.mean(immediate_penalty)
+            real_collision_loss = torch.mean(collision_penalty)
         elif collision_config['collision_loss_type'] == 'l2':
-            real_collision_loss = torch.mean(immediate_penalty ** 2)
+            real_collision_loss = torch.mean(collision_penalty ** 2)
         elif collision_config['collision_loss_type'] == 'exponential':
-            real_collision_loss = torch.mean(torch.exp(immediate_penalty) - 1)
+            real_collision_loss = torch.mean(torch.exp(collision_penalty) - 1)
         else:
-            real_collision_loss = torch.mean(immediate_penalty)
+            real_collision_loss = torch.mean(collision_penalty)
         
         total_collision_loss = real_collision_loss
     
@@ -228,7 +233,7 @@ def compute_collision_loss(logits: torch.Tensor,
         # This prevents double penalization
         if collision_config.get('separate_collision_types', True):
             # Create a mask for agents that are NOT currently colliding
-            no_current_collision_mask = (immediate_penalty == 0).float()
+            no_current_collision_mask = (collision_penalty == 0).float()
             
             future_penalty_tensor = predict_future_collisions(
                 positions, logits, 
@@ -260,11 +265,11 @@ def compute_collision_loss(logits: torch.Tensor,
     
     # Collect collision information for logging
     collision_info = {
-        'total_real_collisions': torch.sum(immediate_penalty > 0).item(),
-        'vertex_collisions': torch.sum(vertex_penalty > 0).item(),
-        'edge_collisions': torch.sum(edge_penalty > 0).item(),
-        'real_collision_rate': torch.mean((immediate_penalty > 0).float()).item(),
-        'avg_real_collision_penalty': torch.mean(immediate_penalty).item(),
+        'total_real_collisions': torch.sum(collision_penalty > 0).item(),
+        'vertex_collisions': 0,  # Not directly available with continuous collision
+        'edge_collisions': 0,    # Not directly available with continuous collision
+        'real_collision_rate': torch.mean((collision_penalty > 0).float()).item(),
+        'avg_real_collision_penalty': torch.mean(collision_penalty).item(),
         'future_collision_penalty': future_penalty_value,
         'real_collision_loss': float(real_collision_loss.item()) if isinstance(real_collision_loss, torch.Tensor) else real_collision_loss,
         'future_collision_loss': float(future_collision_loss.item()),
@@ -337,7 +342,7 @@ def predict_future_collisions(current_positions: torch.Tensor,
     device = current_positions.device
     
     # Convert logits to action probabilities
-    action_probs = torch.softmax(action_logits.view(batch_size, num_agents, -1), dim=-1)
+    action_probs = torch.softmax(action_logits.reshape(batch_size, num_agents, -1), dim=-1)
     
     total_future_penalty = torch.tensor(0.0, device=device)
     positions = current_positions.clone()
@@ -415,7 +420,7 @@ def extract_positions_from_fov(fov: torch.Tensor, num_agents: int, env_positions
     
     # Fallback: Try to extract from center position in FOV
     # The FOV is centered on the agent, so agent position is at center
-    fov_reshaped = fov.view(batch_size, num_agents, fov.size(1), fov.size(2), fov.size(3))
+    fov_reshaped = fov.reshape(batch_size, num_agents, fov.size(1), fov.size(2), fov.size(3))
     fov_height, fov_width = fov.size(2), fov.size(3)
     
     # For now, use a heuristic approach since exact position extraction from FOV
@@ -586,7 +591,7 @@ def load_goal_positions_from_dataset(dataset_root: str, case_indices: List[int],
 def compute_goal_proximity_reward(current_positions: torch.Tensor, goal_positions: torch.Tensor,
                                  reward_type: str = 'inverse', max_distance: float = 10.0,
                                  success_threshold: float = 1.0, track_progress: bool = True,
-                                 previous_positions: torch.Tensor = None) -> torch.Tensor:
+                                 previous_positions: torch.Tensor = None, config=None) -> torch.Tensor:
     """
     Compute goal proximity reward based on distance to goal positions with progress tracking.
     Only rewards agents that are moving toward their goals, not away from them.
@@ -639,15 +644,24 @@ def compute_goal_proximity_reward(current_positions: torch.Tensor, goal_position
         # Add small epsilon to avoid division by zero and clamp to reasonable range
         epsilon = 1e-6
         rewards = 1.0 / (active_distances + epsilon)
-        # Clamp rewards to prevent extreme values
-        rewards = torch.clamp(rewards, max=10.0)  # Cap at 10 to prevent loss explosion
+        # Apply configurable multiplier for stronger goal-seeking behavior
+        proximity_scale = config.get('proximity_reward_scale', 25.0) if config else 25.0
+        rewards = rewards * proximity_scale
+        # Clamp rewards to prevent extreme values (scale cap based on multiplier)
+        rewards = torch.clamp(rewards, max=proximity_scale * 10.0)  # Cap at scale * 10
     elif reward_type == 'exponential':
         # Exponential decay reward: exp(-distance/scale)
         scale = max_distance / 3.0  # Scale factor for exponential decay
         rewards = torch.exp(-active_distances / scale)
+        # Apply configurable multiplier for stronger goal-seeking behavior
+        proximity_scale = config.get('proximity_reward_scale', 25.0) if config else 25.0
+        rewards = rewards * proximity_scale
     elif reward_type == 'linear':
         # Linear reward: (max_distance - distance) / max_distance
         rewards = torch.clamp((max_distance - active_distances) / max_distance, min=0.0)
+        # Apply configurable multiplier for stronger goal-seeking behavior
+        proximity_scale = config.get('proximity_reward_scale', 25.0) if config else 25.0
+        rewards = rewards * proximity_scale
     else:
         raise ValueError(f"Unknown reward_type: {reward_type}")
     
@@ -849,6 +863,8 @@ def compute_best_distance_progress_reward(current_positions: torch.Tensor, goal_
     )
     
     # Calculate progress reward only for eligible agents
+    total_reward = torch.tensor(0.0, device=current_positions.device, dtype=torch.float32)
+    
     if torch.any(eligible_progress_mask):
         # Compute progress amount for eligible agents
         progress_amounts = initial_best_distances[eligible_progress_mask] - current_distances[eligible_progress_mask]
@@ -860,13 +876,220 @@ def compute_best_distance_progress_reward(current_positions: torch.Tensor, goal_
         scaled_progress = progress_amounts * progress_weight
         
         # Sum progress reward across progressing agents only (not averaged by total agents)
-        progress_reward = torch.sum(scaled_progress)
-    else:
-        # No agents made progress, return zero reward
-        progress_reward = torch.tensor(0.0, device=current_positions.device, dtype=torch.float32)
+        total_reward = torch.sum(scaled_progress)
     
     # Remove batch dimension if input was 2D
     if squeeze_output:
         updated_best_distances = updated_best_distances.squeeze(0)
     
-    return progress_reward, updated_best_distances
+    return total_reward, updated_best_distances
+
+def compute_obstacle_aware_progress_reward(current_positions: torch.Tensor, goal_positions: torch.Tensor,
+                                          best_distances: torch.Tensor, obstacles: torch.Tensor,
+                                          progress_weight: float = 1.0, success_threshold: float = 1.0,
+                                          danger_zone_radius: float = 2.0, danger_penalty_weight: float = 2.0) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Compute obstacle-aware progress reward that actively discourages moving towards obstacles.
+    
+    KEY BEHAVIOR:
+    - NO progress reward when moving towards obstacles (even if moving towards goal)
+    - Active penalty when getting too close to obstacles, scaled by best distance achieved
+    - This forces agents to actively avoid danger and learn to reroute
+    
+    Args:
+        current_positions: Current agent positions [batch_size, num_agents, 2] or [num_agents, 2]
+        goal_positions: Goal positions [batch_size, num_agents, 2] or [num_agents, 2]
+        best_distances: Current best distances achieved so far [batch_size, num_agents] or [num_agents]
+        obstacles: Obstacle grid [batch_size, grid_h, grid_w] or list of obstacle positions
+        progress_weight: Weight for progress reward scaling
+        success_threshold: Distance threshold to consider agent has reached goal
+        danger_zone_radius: Radius around obstacles considered dangerous
+        danger_penalty_weight: Weight for danger zone penalty
+        
+    Returns:
+        Tuple of (progress_reward, updated_best_distances)
+        - progress_reward: Progress reward scalar for the batch (can be negative due to penalties)
+        - updated_best_distances: Updated best distances [batch_size, num_agents] or [num_agents]
+    """
+    # Handle both 2D and 3D tensor inputs
+    if current_positions.dim() == 2:
+        # Add batch dimension if missing [num_agents, 2] -> [1, num_agents, 2]
+        current_positions = current_positions.unsqueeze(0)
+        goal_positions = goal_positions.unsqueeze(0)
+        best_distances = best_distances.unsqueeze(0)
+        squeeze_output = True
+    else:
+        squeeze_output = False
+    
+    batch_size, num_agents = current_positions.shape[:2]
+    device = current_positions.device
+    
+    # Compute current distances to goals
+    current_distances = torch.norm(current_positions - goal_positions, dim=2)  # [batch_size, num_agents]
+    
+    # Handle first timestep: initialize best_distances if they are inf
+    is_first_timestep = torch.isinf(best_distances)
+    initial_best_distances = torch.where(is_first_timestep, current_distances, best_distances)
+    
+    # === OBSTACLE DANGER DETECTION ===
+    danger_penalties = torch.zeros_like(current_distances)  # [batch_size, num_agents]
+    moving_towards_obstacles = torch.zeros_like(current_distances, dtype=torch.bool)  # [batch_size, num_agents]
+    
+    for b in range(batch_size):
+        # Convert obstacles to list of positions if it's a grid
+        if isinstance(obstacles, torch.Tensor) and obstacles.dim() == 3:
+            # obstacles is [batch, grid_h, grid_w]
+            obstacle_positions = []
+            grid_h, grid_w = obstacles.shape[1], obstacles.shape[2]
+            for y in range(grid_h):
+                for x in range(grid_w):
+                    if obstacles[b, y, x] > 0.5:  # Obstacle present
+                        obstacle_positions.append([x, y])  # Note: x,y order
+            obstacle_positions = torch.tensor(obstacle_positions, device=device, dtype=torch.float32)
+        elif isinstance(obstacles, list) and len(obstacles) > 0:
+            # obstacles is list of positions
+            obstacle_positions = torch.tensor(obstacles, device=device, dtype=torch.float32)
+        else:
+            # No obstacles, skip danger detection
+            continue
+            
+        if len(obstacle_positions) == 0:
+            continue
+            
+        for a in range(num_agents):
+            agent_pos = current_positions[b, a]  # [2]
+            goal_pos = goal_positions[b, a]  # [2]
+            
+            # Find closest obstacle
+            if len(obstacle_positions) > 0:
+                obstacle_distances = torch.norm(obstacle_positions - agent_pos.unsqueeze(0), dim=1)  # [num_obstacles]
+                min_obstacle_dist = torch.min(obstacle_distances)
+                closest_obstacle_pos = obstacle_positions[torch.argmin(obstacle_distances)]
+                
+                # Check if agent is in danger zone - apply penalty proportional to best distance
+                # The closer to obstacle and the better the best distance, the higher the penalty
+                if min_obstacle_dist <= danger_zone_radius:
+                    # Calculate penalty based on how close to obstacle and best distance achieved
+                    danger_proximity = (danger_zone_radius - min_obstacle_dist) / danger_zone_radius  # 0 to 1
+                    best_dist_factor = initial_best_distances[b, a] + 1.0  # Add 1 to avoid division by zero
+                    
+                    # Penalty scales with both proximity to danger and progress made (best distance)
+                    # This makes agents that have made progress more cautious about dangers
+                    danger_penalties[b, a] = danger_penalty_weight * danger_proximity * best_dist_factor
+                
+                # Check if agent is moving towards closest obstacle
+                # Direction from agent to goal
+                goal_direction = goal_pos - agent_pos
+                goal_direction_norm = goal_direction / (torch.norm(goal_direction) + 1e-8)
+                
+                # Direction from agent to closest obstacle
+                obstacle_direction = closest_obstacle_pos - agent_pos
+                obstacle_direction_norm = obstacle_direction / (torch.norm(obstacle_direction) + 1e-8)
+                
+                # Check if directions are similar (dot product > threshold)
+                # Lower threshold means we're more strict about what counts as "moving towards obstacle"
+                direction_similarity = torch.dot(goal_direction_norm, obstacle_direction_norm)
+                if direction_similarity > 0.2:  # Moving towards obstacle (more strict threshold)
+                    moving_towards_obstacles[b, a] = True
+    
+    # === PROGRESS REWARD COMPUTATION ===
+    # Find agents that achieved new best (lower) distances (but not on first timestep)
+    progress_mask = (current_distances < initial_best_distances) & (~is_first_timestep)  # [batch_size, num_agents]
+    
+    # Exclude agents that have already reached their goals from progress rewards
+    agents_at_goal_mask = current_distances <= success_threshold  # [batch_size, num_agents]
+    
+    # STRICT RULE: NO progress reward if moving towards obstacles, even if making progress towards goal
+    safe_progress_mask = progress_mask & (~agents_at_goal_mask) & (~moving_towards_obstacles)  # [batch_size, num_agents]
+    
+    # Update best distances: use current distance if it's better, or if this is first timestep
+    # Do NOT include danger penalties in best distance - keep it as pure goal distance
+    updated_best_distances = torch.where(
+        (current_distances < initial_best_distances) | is_first_timestep, 
+        current_distances, 
+        initial_best_distances
+    )
+    
+    # Calculate progress reward only for safe-progress agents (those NOT moving towards obstacles)
+    total_reward = torch.tensor(0.0, device=device, dtype=torch.float32)
+    
+    if torch.any(safe_progress_mask):
+        # Compute progress amount for safe-progress agents
+        progress_amounts = initial_best_distances[safe_progress_mask] - current_distances[safe_progress_mask]
+        
+        # Clamp progress amounts to avoid inf values
+        progress_amounts = torch.clamp(progress_amounts, max=100.0)
+        
+        # Scale progress by progress weight
+        scaled_progress = progress_amounts * progress_weight
+        
+        # Sum progress reward across safe-progressing agents
+        total_reward += torch.sum(scaled_progress)
+    
+    # Apply danger penalties to total reward (negative contribution)
+    # This creates a strong incentive to avoid danger zones
+    if torch.any(danger_penalties > 0):
+        total_penalty = torch.sum(danger_penalties)
+        total_reward -= total_penalty
+    
+    # Remove batch dimension if input was 2D
+    if squeeze_output:
+        updated_best_distances = updated_best_distances.squeeze(0)
+    
+    return total_reward, updated_best_distances
+
+def compute_continuous_collision_penalty(positions: torch.Tensor, 
+                                       collision_config: Dict) -> torch.Tensor:
+    """
+    Compute continuous collision penalty based on inverse Manhattan distance.
+    Penalizes agents that are close to each other (within threshold distance).
+    Uses smooth, continuous penalty for better numerical stability and gradients.
+    
+    Args:
+        positions: Agent positions [batch, num_agents, 2]
+        collision_config: Configuration parameters
+        
+    Returns:
+        collision_penalty: Penalty per agent [batch, num_agents]
+    """
+    batch_size, num_agents = positions.shape[:2]
+    device = positions.device
+    
+    # Get collision threshold and weights
+    threshold = collision_config.get('collision_threshold', 2.0)
+    vertex_weight = collision_config.get('vertex_collision_weight', 1.0)
+    
+    # Initialize penalty tensor
+    collision_penalty = torch.zeros(batch_size, num_agents, device=device)
+    
+    # Compute pairwise distances for all agent pairs
+    for i in range(num_agents):
+        for j in range(i + 1, num_agents):
+            # Manhattan distance between agents i and j
+            pos_i = positions[:, i, :]  # [batch, 2]
+            pos_j = positions[:, j, :]  # [batch, 2]
+            
+            manhattan_dist = torch.sum(torch.abs(pos_i - pos_j), dim=1)  # [batch]
+            
+            # Apply penalty for agents within threshold distance
+            within_threshold = manhattan_dist < threshold
+            
+            if within_threshold.any():
+                # Continuous inverse distance penalty: penalty = weight * (threshold - dist) / (dist + epsilon)
+                # This gives smooth gradients and penalizes closer agents more heavily
+                epsilon = 0.01  # Small epsilon for numerical stability
+                
+                # Smooth penalty function: higher penalty for closer agents
+                # penalty = weight * (threshold - dist)^2 / (dist + epsilon)
+                # This ensures penalty -> 0 as dist -> threshold, and penalty -> infinity as dist -> 0
+                distance_diff = torch.clamp(threshold - manhattan_dist, min=0.0)  # Only positive differences
+                inv_dist_penalty = vertex_weight * (distance_diff ** 2) / (manhattan_dist + epsilon)
+                
+                # Apply penalty only when within threshold
+                penalty_value = torch.where(within_threshold, inv_dist_penalty, torch.zeros_like(inv_dist_penalty))
+                
+                # Add penalty to both agents involved in the collision
+                collision_penalty[:, i] += penalty_value
+                collision_penalty[:, j] += penalty_value
+    
+    return collision_penalty

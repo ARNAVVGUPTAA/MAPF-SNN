@@ -397,7 +397,7 @@ class DAggerTrainer:
                         # Execute policy action
                         fov_tensor = torch.tensor(obs['fov']).float().unsqueeze(0).to(self.device)
                         logits = self.model(fov_tensor)
-                        logits = logits.view(-1, self.config['num_agents'], self.model.num_classes)
+                        logits = logits.reshape(-1, self.config['num_agents'], self.model.num_classes)
                         policy_actions = torch.argmax(logits[0], dim=1).cpu().numpy()
 
                         # Query expert with current β probability, else use policy action as label
@@ -512,17 +512,17 @@ class DAggerTrainer:
         Generate synthetic FOV data as a last resort fallback.
         
         Returns:
-            Synthetic FOV tensor of shape [num_agents, 2, 5, 5]
+            Synthetic FOV tensor of shape [num_agents, 2, 7, 7]
         """
         num_agents = self.config["num_agents"]
         # Create minimal FOV: empty environment with agent in center
-        synthetic_fov = np.zeros((num_agents, 2, 5, 5), dtype=np.float32)
+        synthetic_fov = np.zeros((num_agents, 2, 7, 7), dtype=np.float32)
         
         # For each agent, put the agent in the center of its FOV
         for agent_idx in range(num_agents):
             # Channel 0: obstacles (all zeros = no obstacles visible)
             # Channel 1: agents (put this agent in center)
-            synthetic_fov[agent_idx, 1, 2, 2] = 1.0  # Agent at center of its FOV
+            synthetic_fov[agent_idx, 1, 3, 3] = 1.0  # Agent at center of its FOV
             
         return synthetic_fov
 
@@ -565,7 +565,7 @@ class DAggerTrainer:
                         if len(fov_data) == expected_size:
                             fov_tensor = torch.tensor(fov_data, dtype=torch.float32)
                             # Reshape to [agents, channels, height, width] then flatten to [agents*channels*height*width]
-                            fov_tensor = fov_tensor.view(num_agents, channels, height, width)
+                            fov_tensor = fov_tensor.reshape(num_agents, channels, height, width)
                             all_fovs.append(fov_tensor)
                             all_case_indices.append(case_idx)
                         else:
@@ -598,7 +598,7 @@ class DAggerTrainer:
             return
         
         # Stack into tensors
-        fov_tensor = torch.stack(all_fovs)  # [num_samples, 2, 5, 5]
+        fov_tensor = torch.stack(all_fovs)  # [num_samples, 2, 7, 7]
         action_tensor = torch.stack(all_actions)  # [num_samples, num_agents]
         
         print(f"FOV tensor shape: {fov_tensor.shape}")
@@ -746,7 +746,7 @@ class DAggerTrainer:
                 # Forward pass with spike information
                 spikes, spike_info = self.model(batch_fovs, return_spikes=True)
                 logits = spike_info.get('action_logits', spikes)  # Use action logits if available
-                logits = logits.view(batch_size, self.config["num_agents"], -1)
+                logits = logits.reshape(batch_size, self.config["num_agents"], -1)
                 
                 # Collect spike counts for reporting
                 for phase_name, phase_spikes in spike_info.items():
@@ -780,7 +780,7 @@ class DAggerTrainer:
                 use_entropy_bonus = self.config.get('use_entropy_bonus', False)
                 if use_entropy_bonus and entropy_bonus_weight > 0:
                     from train import compute_entropy_bonus
-                    logits_flat = logits.view(-1, logits.size(-1))
+                    logits_flat = logits.reshape(-1, logits.size(-1))
                     entropy_bonus = compute_entropy_bonus(logits_flat)
                     loss -= entropy_bonus_weight * entropy_bonus
                     # Record entropy bonus contribution
@@ -794,13 +794,13 @@ class DAggerTrainer:
                         predicted_actions = torch.argmax(logits, dim=-1)  # [batch_size, num_agents]
                         
                         # Simulate agent movement from initial positions based on predicted actions
-                        # Action mapping: 0=stay, 1=up, 2=down, 3=left, 4=right
+                        # Action mapping: 0=stay, 1=right, 2=up, 3=left, 4=down (FIXED to match environment)
                         action_deltas = torch.tensor([
-                            [0, 0],   # stay
-                            [0, -1],  # up
-                            [0, 1],   # down
-                            [-1, 0],  # left
-                            [1, 0]    # right
+                            [0, 0],   # 0: Stay
+                            [1, 0],   # 1: Right
+                            [0, 1],   # 2: Up
+                            [-1, 0],  # 3: Left
+                            [0, -1]   # 4: Down
                         ], dtype=torch.float32, device=self.device)
                         
                         # Apply actions to get new positions
@@ -839,7 +839,7 @@ class DAggerTrainer:
                         }
 
                         # Flatten logits for collision loss computation
-                        logits_flat = logits.view(-1, logits.size(-1))
+                        logits_flat = logits.reshape(-1, logits.size(-1))
                         collision_loss, collision_stats = compute_collision_loss(
                             logits_flat, current_positions, prev_positions=None,
                             collision_config=collision_config
@@ -914,7 +914,7 @@ class DAggerTrainer:
                         from collision_utils import compute_goal_proximity_reward
                         
                         prox_reward = compute_goal_proximity_reward(
-                            current_positions, goal_positions, reward_type, max_distance, success_threshold, track_progress=True
+                            current_positions, goal_positions, reward_type, max_distance, success_threshold, track_progress=True, config=self.config
                         )
                         loss -= goal_proximity_weight * prox_reward  # Subtract to encourage goal-seeking
                         sum_goal_prox_reward += (goal_proximity_weight * prox_reward).item()
@@ -1064,13 +1064,13 @@ class DAggerTrainer:
                     val_actions_device = val_actions.to(self.device)
                     
                     # Extract temporal dimension from FOV data
-                    # Expected shape: [batch_size, T, num_agents, 2, 5, 5] OR [batch_size, num_agents, 2, 5, 5] (single timestep)
+                    # Expected shape: [batch_size, T, num_agents, 2, 7, 7] OR [batch_size, num_agents, 2, 7, 7] (single timestep)
                     if val_fovs_device.dim() == 6:
-                        # Multi-timestep data: [batch_size, T, num_agents, 2, 5, 5]
+                        # Multi-timestep data: [batch_size, T, num_agents, 2, 7, 7]
                         val_batch_size, T, num_agents = val_fovs_device.shape[:3]
                         print(f"Multi-step validation: T={T} timesteps, batch={val_batch_size}, agents={num_agents}")
                     else:
-                        # Single timestep data: [batch_size, num_agents, 2, 5, 5] -> expand to [batch_size, 1, num_agents, 2, 5, 5]
+                        # Single timestep data: [batch_size, num_agents, 2, 7, 7] -> expand to [batch_size, 1, num_agents, 2, 7, 7]
                         val_batch_size, num_agents = val_fovs_device.shape[:2]
                         T = 1
                         val_fovs_device = val_fovs_device.unsqueeze(1)  # Add time dimension
@@ -1146,15 +1146,15 @@ class DAggerTrainer:
                     # Run model for T timesteps
                     for t in range(T):
                         # Get FOV for current timestep
-                        fov_t = val_fovs_device[:, t]  # [batch_size, num_agents, 2, 5, 5]
+                        fov_t = val_fovs_device[:, t]  # [batch_size, num_agents, 2, 7, 7]
                         
-                        # Reshape for model input: [batch_size * num_agents, 2, 5, 5]
-                        fov_input = fov_t.view(val_batch_size * num_agents, 2, 5, 5)
+                        # Reshape for model input: [batch_size * num_agents, 2, 7, 7]
+                        fov_input = fov_t.reshape(val_batch_size * num_agents, 2, 7, 7)
                         
                         # Forward pass with spike information
                         val_spikes, val_spike_info = self.model(fov_input, return_spikes=True)
                         val_logits = val_spike_info.get('action_logits', val_spikes)
-                        val_logits = val_logits.view(val_batch_size, num_agents, -1)
+                        val_logits = val_logits.reshape(val_batch_size, num_agents, -1)
                         
                         # Get targets for this timestep
                         if val_actions_device.dim() == 3:
@@ -1191,7 +1191,7 @@ class DAggerTrainer:
                                     'per_agent_loss': self.config.get('per_agent_collision_loss', True)
                                 }
                                 
-                                val_logits_flat = val_logits.view(-1, val_logits.size(-1))
+                                val_logits_flat = val_logits.reshape(-1, val_logits.size(-1))
                                 val_collision_loss, _ = compute_collision_loss(
                                     val_logits_flat, val_current_positions, prev_positions=None,
                                     collision_config=collision_config
@@ -1291,7 +1291,7 @@ class DAggerTrainer:
                         reward_type = self.config.get('goal_proximity_type', 'exponential')
                         max_distance = self.config.get('goal_proximity_max_distance', 10.0)
                         val_goal_proximity = compute_goal_proximity_reward(
-                            val_current_positions, val_goal_positions, reward_type, max_distance
+                            val_current_positions, val_goal_positions, reward_type, max_distance, config=self.config
                         ).item()
                         
                     except Exception as e:
@@ -1381,7 +1381,7 @@ class DAggerTrainer:
         with torch.no_grad():
             for idx in tqdm(range(total_cases), desc="Evaluating policy", unit="cases"):
                 case = self.data_loader.train_loader.dataset[idx]
-                fov_seq = case['states']                # (time, agents, 2, 5, 5)
+                fov_seq = case['states']                # (time, agents, 2, 7, 7)
                 expert_seq = case['actions'].long()     # (time, agents)
                 T, num_agents = expert_seq.shape
                 total_agents += num_agents
@@ -1391,7 +1391,7 @@ class DAggerTrainer:
                 for t in range(min(T, self.max_timesteps)):
                     fov = fov_seq[t].unsqueeze(0).to(self.device)
                     logits = self.model(fov)
-                    logits = logits.view(-1, num_agents, self.model.num_classes)
+                    logits = logits.reshape(-1, num_agents, self.model.num_classes)
                     preds = torch.argmax(logits[0], dim=1).cpu()
                     pred_seq[t] = preds
                 for a in range(num_agents):
@@ -1437,7 +1437,7 @@ class DAggerTrainer:
                 for t in range(min(T, self.max_timesteps)):
                     fov = fov_seq[t].unsqueeze(0).to(self.device)
                     logits = self.model(fov)
-                    logits = logits.view(-1, num_agents, self.model.num_classes)
+                    logits = logits.reshape(-1, num_agents, self.model.num_classes)
                     preds = torch.argmax(logits[0], dim=1).cpu()
                     pred_seq[t] = preds
                 
@@ -1528,7 +1528,7 @@ class DAggerTrainer:
                 for t in range(min(T, self.max_timesteps)):
                     fov = fov_seq[t].unsqueeze(0).to(self.device)
                     logits = self.model(fov)
-                    logits = logits.view(-1, num_agents, self.model.num_classes)
+                    logits = logits.reshape(-1, num_agents, self.model.num_classes)
                     preds = torch.argmax(logits[0], dim=1).cpu()
                     pred_seq[t] = preds
                 

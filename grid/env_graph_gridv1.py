@@ -26,7 +26,7 @@ class GraphEnv(gym.Env):
         max_time=23,
         board_size=10,
         sensing_range=6,
-        pad=3,
+        pad=4,
         starting_positions=None,
         obstacles=None,
     ):
@@ -42,6 +42,8 @@ class GraphEnv(gym.Env):
         self.board_size = self.config["board_size"][0]
         if obstacles is not None:
             self.obstacles = obstacles
+        else:
+            self.obstacles = None
         self.goal = goal
         self.board = np.zeros((self.board_size, self.board_size))
         self.pad = pad
@@ -260,8 +262,8 @@ class GraphEnv(gym.Env):
         for agent in range(self.nb_agents):
             FOV[agent, 0, :, :] = np.flip(
                 map_padded[
-                    self.positionY[agent] + 1 : self.positionY[agent] + 6,
-                    self.positionX[agent] + 1 : self.positionX[agent] + 6,
+                    self.positionY[agent] : self.positionY[agent] + 7,
+                    self.positionX[agent] : self.positionX[agent] + 7,
                 ],
                 axis=0,
             )

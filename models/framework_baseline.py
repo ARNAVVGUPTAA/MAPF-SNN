@@ -99,9 +99,9 @@ class Network(nn.Module):
         for id_agent in range(self.num_agents):
             agent_state = states[:, id_agent, :, :, :]
             features = self.convLayers(agent_state)
-            features_flatten = features.view(features.size(0), -1)
+            features_flatten = features.reshape(features.size(0), -1)
             encoded_feats = self.compressMLP(features_flatten)
-            encoded_feats_flat = encoded_feats.view(encoded_feats.size(0), -1)
+            encoded_feats_flat = encoded_feats.reshape(encoded_feats.size(0), -1)
             x = self.actionMLP(encoded_feats_flat)
             if self.net_type == "snn" and self.fc_out is not None and self.out_neuron is not None:
                 pre_spikes = x

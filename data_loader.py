@@ -309,14 +309,14 @@ class MAPFBaseDataset(Dataset):
 class CreateSNNDataset(MAPFBaseDataset):
     """
     Dataset for SNN models. Returns (states, trajectories, gsos) per case.
-    States are returned as (time, agents, 2, 5, 5) for SNN input.
+    States are returned as (time, agents, 2, 7, 7) for SNN input.
     """
 
     def __init__(self, config, mode, resolve_obstacle_conflicts=True):
         super().__init__(config, mode, resolve_obstacle_conflicts)
 
     def __getitem__(self, index):
-        states = torch.from_numpy(self.states[index]).float()  # (time, agents, 2, 5, 5)
+        states = torch.from_numpy(self.states[index]).float()  # (time, agents, 2, 7, 7)
         trayec = torch.from_numpy(self.trajectories[index]).float()  # (time, agents)
         gsos = torch.from_numpy(self.gsos[index]).float()  # (time, agents, agents)
         case_idx = self.case_indices[index]  # Get case index for expert trajectory
@@ -328,19 +328,19 @@ class CreateSNNDataset(MAPFBaseDataset):
 class CreateGNNDataset(MAPFBaseDataset):
     """
     Dataset for GNN/baseline models. Returns (states, trajectories, gsos) per time step.
-    States are reshaped to (samples, agents, 2, 5, 5) for GNN input.
+    States are reshaped to (samples, agents, 2, 7, 7) for GNN input.
     """
 
     def __init__(self, config, mode, resolve_obstacle_conflicts=True):
         super().__init__(config, mode, resolve_obstacle_conflicts)
         # Flatten across time for GNN: (cases, time, ...) -> (cases*time, ...)
-        self.states = self.states.reshape(-1, self.config["nb_agents"], 2, 5, 5)
+        self.states = self.states.reshape(-1, self.config["nb_agents"], 2, 7, 7)
         self.trajectories = self.trajectories.reshape(-1, self.config["nb_agents"])
         self.gsos = self.gsos.reshape(-1, self.config["nb_agents"], self.config["nb_agents"])
         self.count = self.states.shape[0]
 
     def __getitem__(self, index):
-        states = torch.from_numpy(self.states[index]).float()  # (agents, 2, 5, 5)
+        states = torch.from_numpy(self.states[index]).float()  # (agents, 2, 7, 7)
         trayec = torch.from_numpy(self.trajectories[index]).float()  # (agents,)
         gsos = torch.from_numpy(self.gsos[index]).float()  # (agents, agents)
         return states, trayec, gsos
