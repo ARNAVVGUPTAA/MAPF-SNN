@@ -33,11 +33,11 @@ max_spike_decay: 5e-5    # Maximum spike decay value
 spike_decay_coeff: 0.2  # Spike decay coefficient
 
 # Spike Rate Monitoring (Adaptive Threshold)
-target_spike_rate: 0.20      # Target spike rate for healthy SNN (20%)
-max_spike_rate: 0.25         # Healthy upper bound for spike rate (25%)
-min_spike_rate: 0.10         # Healthy lower bound for spike rate (10%)
-fine_max_spike_rate: 0.30    # Fine spike rate upper bound (30%)
-fine_min_spike_rate: 0.05    # Fine spike rate lower bound (5%)
+target_spike_rate: 0.075     # Target spike rate for healthy SNN (7.5%)
+max_spike_rate: 0.10         # Healthy upper bound for spike rate (10%)
+min_spike_rate: 0.05         # Healthy lower bound for spike rate (5%)
+fine_max_spike_rate: 0.15    # Fine spike rate upper bound (15%)
+fine_min_spike_rate: 0.03    # Fine spike rate lower bound (3%)
 model_output_spike_threshold: 0.01  # Initial threshold for spike detection
 
 # Cosine Annealing Schedule Parameters
@@ -167,12 +167,12 @@ surrogate_alpha: 15.0      # Surrogate gradient slope (REDUCED for smoother grad
 
 # SNN Health and Sparsity Control - USING ADAPTIVE THRESHOLDS (not sparsity loss)
 # spike_sparsity_weight: 20.0           # Strong sparsity enforcement (DISABLED - overwhelming the model)
-target_spike_rate: 0.20               # Target spike rate for healthy SNN (20%)
+target_spike_rate: 0.075              # Target spike rate for healthy SNN (7.5%)
 spike_rate_tolerance: 0.02           # Allow ±2% deviation from target (tightened)
-max_spike_rate: 0.25                 # Healthy upper bound for spike rate (25%)
-min_spike_rate: 0.10                 # Healthy lower bound for spike rate (10%)
-fine_max_spike_rate: 0.30           # Fine spike rate upper bound (30%)
-fine_min_spike_rate: 0.05           # Fine spike rate lower bound (5%)
+max_spike_rate: 0.10                 # Healthy upper bound for spike rate (10%)
+min_spike_rate: 0.05                 # Healthy lower bound for spike rate (5%)
+fine_max_spike_rate: 0.15           # Fine spike rate upper bound (15%)
+fine_min_spike_rate: 0.03           # Fine spike rate lower bound (3%)
 membrane_leak: 0.9                   # Higher membrane potential decay (INCREASED for health)
 reset_potential: 0.0                 # Reset potential after spike
 

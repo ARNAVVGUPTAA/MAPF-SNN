@@ -173,9 +173,12 @@ class AdaptiveLIFNode(neuron.LIFNode):
         # SMART ADAPTIVE THRESHOLD LOGIC for normalized inputs
         if self.training:
             with torch.no_grad():  # Ensure threshold adaptation doesn't interfere with gradients
-                target_rate = config.get('target_spike_rate', 0.08)  # 8% target from config
-                max_spike_rate = config.get('max_spike_rate', 0.15)   # 15% maximum from config  
-                min_spike_rate = config.get('min_spike_rate', 0.008)  # 0.8% minimum from config
+                # Spike rate targets and zones
+                target_rate = config.get('target_spike_rate', 0.075)       # 7.5% healthy target
+                max_spike_rate = config.get('max_spike_rate', 0.10)        # 10% healthy upper bound
+                min_spike_rate = config.get('min_spike_rate', 0.05)        # 5% healthy lower bound
+                fine_max = config.get('fine_max_spike_rate', 0.15)         # 15% fine upper bound
+                fine_min = config.get('fine_min_spike_rate', 0.03)         # 3% fine lower bound
                 current_rate = out.detach().mean()
                 
                 # Get current membrane potential statistics
@@ -185,40 +188,29 @@ class AdaptiveLIFNode(neuron.LIFNode):
                 # For NORMALIZED inputs, we expect membrane potentials in a predictable range
                 # Since inputs are normalized to [-1, 1], membrane potentials should be reasonable
                 
-                # HEALTHY ZONE: No adjustment needed if spike rate is in acceptable range
+                # HEALTHY ZONE: no change
                 if min_spike_rate <= current_rate <= max_spike_rate:
-                    # Spike rate is healthy - no threshold adjustment needed
                     pass
-                
-                # TOO FEW SPIKES: Lower threshold to increase firing
-                elif current_rate < min_spike_rate:
-                    # Calculate how much to lower threshold based on severity
+                # MILD LOW: rate between fine_min and min_spike (0.03–0.05)
+                elif fine_min <= current_rate < min_spike_rate:
                     spike_deficit = (min_spike_rate - current_rate) / (min_spike_rate + 1e-8)
-                    
-                    if current_rate == 0.0:
-                        # Complete silence - emergency threshold reduction
-                        new_threshold = membrane_mean - 0.5 * membrane_std
-                    else:
-                        # Gradual threshold reduction based on deficit
-                        threshold_reduction = spike_deficit * 0.3 * membrane_std
-                        new_threshold = self.v_threshold - threshold_reduction
-                    
-                    # Apply the adjustment with momentum (smoother adaptation)
-                    adaptation_weight = min(0.5, spike_deficit)  # Max 50% adaptation per step
+                    threshold_reduction = spike_deficit * 0.3 * membrane_std
+                    new_threshold = self.v_threshold - threshold_reduction
+                    adaptation_weight = min(0.5, spike_deficit)
                     new_threshold = (1.0 - adaptation_weight) * self.v_threshold + adaptation_weight * new_threshold
-                
-                # TOO MANY SPIKES: Raise threshold to reduce firing  
-                elif current_rate > max_spike_rate:
-                    # Calculate how much to raise threshold based on severity
-                    spike_excess = (current_rate - max_spike_rate) / max_spike_rate
-                    
-                    # Gradual threshold increase based on excess
-                    threshold_increase = spike_excess * 0.5 * membrane_std
+                # AGGRESSIVE LOW: rate below fine_min (below 3%)
+                elif current_rate < fine_min:
+                    new_threshold = membrane_mean - 1.0 * membrane_std
+                # MILD HIGH: rate between max_spike and fine_max (10–15%)
+                elif max_spike_rate < current_rate <= fine_max:
+                    spike_excess = (current_rate - max_spike_rate) / (fine_max or 1e-8)
+                    threshold_increase = spike_excess * 0.3 * membrane_std
                     new_threshold = self.v_threshold + threshold_increase
-                    
-                    # Apply the adjustment with momentum
-                    adaptation_weight = min(0.7, spike_excess)  # Max 70% adaptation for high spike rates
+                    adaptation_weight = min(0.5, spike_excess)
                     new_threshold = (1.0 - adaptation_weight) * self.v_threshold + adaptation_weight * new_threshold
+                # AGGRESSIVE HIGH: rate above fine_max (above 15%)
+                elif current_rate > fine_max:
+                    new_threshold = self.v_threshold + 1.0 * membrane_std
                 
                 # Apply reasonable bounds for normalized inputs
                 # With normalized inputs, thresholds should be in a reasonable range
