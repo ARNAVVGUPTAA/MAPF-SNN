@@ -1,489 +1,57 @@
-# ===============================
-# SNN MAPF Configuration File
-# ===============================
-
-# Experiment Setup
-exp_name: 'trained_models/snn_experiment'
-net_type: 'snn'
-
-# =============================================================================
-# TRAINING PARAMETERS
-# =============================================================================
-
-# Basic Training
-epochs: 100
-tests_episodes: 50
-device: 'cpu'           # Changed from 'cuda' to 'cpu' since no NVIDIA GPU available
-
-# Learning Parameters
-learning_rate: 1e-6      # Adam learning rate (increased from 1e-12 - normalization allows higher LR)
-weight_decay: 2e-8       # L2 regularization weight
-lr_decay_factor: 0.7     # Learning rate decay factor for scheduler   
-lr_patience: 5          # Patience for LR scheduler
-early_stop_patience: 25  # Patience for early stopping
-early_stop_threshold: 0.5 # Minimum success rate threshold
-
-# Gradient Clipping
-gradient_clip_max_norm: 2.0  # Maximum norm for gradient clipping (increased from 1.0 - less aggressive clipping)
-
-# Spike Regularization
-spike_reg_weight: 5e-3   # Weight for spike regularization loss
-spike_reg_coef: 5e-3     # Spike regularization coefficient
-max_spike_decay: 5e-5    # Maximum spike decay value
-spike_decay_coeff: 0.2  # Spike decay coefficient
-
-# Spike Rate Monitoring (Adaptive Threshold)
-target_spike_rate: 0.075     # Target spike rate for healthy SNN (7.5%)
-max_spike_rate: 0.10         # Healthy upper bound for spike rate (10%)
-min_spike_rate: 0.05         # Healthy lower bound for spike rate (5%)
-fine_max_spike_rate: 0.15    # Fine spike rate upper bound (15%)
-fine_min_spike_rate: 0.03    # Fine spike rate lower bound (3%)
-model_output_spike_threshold: 0.01  # Initial threshold for spike detection
-
-# Cosine Annealing Schedule Parameters
-use_cosine_annealing: true         # Enable cosine annealing for regularizers
-cosine_T_max: 50                   # Period of cosine annealing (typically same as epochs)
-cosine_eta_min_ratio: 0.01         # Minimum value ratio (min_value = eta_min_ratio * initial_value)
-cosine_restart_period: 25          # Period for cosine restart (0 = no restart)
-
-# Expert Training (Teacher-Forcing) Parameters
-use_expert_training: true          # Enable teacher-forcing with expert demonstrations
-expert_interval: 10                # Apply expert training every N epochs (10, 20, 30, 40...)
-expert_ratio: 0.1                  # Ratio of expert data to mix in (10% expert, 90% normal)
-expected_expert_trajectory_length: 16  # Expected length of expert trajectories (pure RL starts after this)
-expert_weight: 0.1                 # Weight multiplier for expert samples
-
-# Pre-training Parameters
-enable_pretraining: true           # Enable pre-training on simple scenarios
-use_progressive_pretraining: true  # Use progressive training (3x3 -> 5x5 -> 7x7)
-pretraining_epochs: 28             # Total pre-training epochs (INCREASED from 20 to accommodate longer 5x5 stage)
-pretraining_batches_per_epoch: 50  # Number of batches per pre-training epoch
-visualize_pretraining: false       # Visualize sample pre-training scenarios (disabled for faster training)
-
-# Progressive Pre-training Schedule
-pretraining_schedule:
-  - grid_size: 3
-    epochs: 3              # INCREASED from 4 to 8 for more goal-seeking practice
-    sequence_length: 50     # Shorter sequences for 3x3
-    obstacles: 0           # No obstacles in stage 1 for basic goal-seeking practice
-  - grid_size: 5  
-    epochs: 4             # INCREASED from 7 to 15 - more time to adapt to complexity jump
-    sequence_length: 100   # INCREASED from 15 to 25 - allow expert to provide complete solutions
-  - grid_size: 7
-    epochs: 4              # INCREASED from 3 to 5 for more goal-seeking practice
-    sequence_length: 100   # Longer sequences for 7x7
-
-# Batch Normalization
-batch_norm_momentum: 0.7  # Momentum for batch norm running statistics
-batch_norm_eps: 0.00001   # Epsilon for batch norm numerical stability
-
-# =============================================================================
-# DATA LOADING
-# =============================================================================
-
-# Dataset Configuration
+epochs: 50
+sequence_length: 100
+board_size: [9,9]
+num_actions: 5
+num_agents: 5
+hidden_dim: 128
+input_dim: 147
+reward_scale: 0.2
+punishment_scale: 0.2
+goal_reward: 10.0
+collision_punishment: -8.0
+step_penalty: -0.5
+cooperation_bonus: 3.0
+reward_decay: 0.95
+trace_length: 10
+expected_expert_trajectory_length: 16
 train:
   root_dir: 'dataset/5_8_28'
-  mode: 'train'
-  min_time: 5   # Adaptive minimum time - use what's available (reduced from 40)
-  max_time_dl: 60  # Increased max time accordingly
+  min_time: 4
+  max_time_dl: 60
   nb_agents: 5
-  batch_size: 64  # Reduced from 128 to accommodate longer sequences
-
+  batch_size: 8
+  num_workers: 0
 valid:
   root_dir: 'dataset/5_8_28'
-  mode: 'valid'
-  min_time: 5   # Adaptive minimum time - use what's available (reduced from 40)
-  max_time_dl: 60  # Increased max time accordingly
+  min_time: 4
+  max_time_dl: 60
   nb_agents: 5
-  batch_size: 20  # Reduced from 128 to get more validation batches
-
-# Visualization Settings
-visualize_training: true       # Enable training visualization - fixed threading issues
-vis_update_freq: 1         # Update visualization every 1 batch
-vis_episode_frequency: 5   # Show episode animation every N batches (0 = disable episode animation)
-animate_episodes: true     # Enable step-by-step episode animation with SNN actions
-max_vis_episodes: 3        # Maximum number of episodes to animate per visualization update
-
-# Data Loader Settings
-min_time: 5   # Adaptive minimum time - use what's available (reduced from 40)
-sequence_length: 100  # Multi-step training sequence length - increased for better RL understanding
-num_workers: 3
-batch_size: 40  # Reduced from 128 to accommodate longer sequences
-
-# =============================================================================
-# ENVIRONMENT PARAMETERS
-# =============================================================================
-
-# Simulation Environment
-board_size: [9, 9]
-map_shape: [9, 9]
-num_agents: 5
-obstacles: 5               # REMOVED OBSTACLES (was 5)
-max_steps: 40
-max_time: 40
-sensing_range: 6
-
-# =============================================================================
-# SNN ARCHITECTURE PARAMETERS
-# =============================================================================
-
-# Model Dimensions
-input_dim: 147  # 7x7 FOV * 3 channels (obstacles/agents, MY goal, OTHER goals) = 147
-hidden_dim: 128
-hidden_size: 200  
-num_actions: 5
-
-# SNN Output Layer Configuration
-output_neurons_per_action: 40  # 40 neurons per action class for population coding (5 * 40 = 200 total) - INCREASED from 20
-
-# SNN Neuron Parameters
-lif_tau: 10.0              # RESET: More standard value instead of 40.0
-lif_v_reset: 0.0           # Reset voltage after spike (KEPT SAME)
-lif_v_threshold: 0.25       # CRITICAL: Increase from 0.01 to 0.5 for reasonable spike rates
-adapt_tau: 150.0           # RESET: Back to standard value instead of 300.0
-adapt_alpha: 0.02          # RESET: Back to standard value instead of 0.04
-
-# SNN Temporal Parameters
-snn_time_steps: 13        # Number of SNN time steps (KEPT SAME)
-tau: 50.0                  # Membrane time constant - DOUBLED from 25.0
-v_threshold: 4.0          # Spike threshold - INCREASED AGAIN from 3.0 to reduce spike rate
-v_threshold_output: 4.0   # Output layer spike threshold - INCREASED AGAIN from 3.0 to reduce spike rate
-tau_output: 16.0           # Output layer time constant - DOUBLED from 8.0
-detach_reset: false       # Detach reset for gradient flow (KEPT SAME)
-
-# Input Processing
-input_scale: 1.0           # RESET: Drastically reduce from 15.0 - let AdaptiveLIF handle spike control
-output_scale: 1.0          # RESET: Increase from 0.4 for stronger signal
-# Spike sparsity parameters (DISABLED - using adaptive thresholds instead)
-# spike_sparsity_weight: 16.0 # Spike sparsity regularization weight (DISABLED - overwhelming the model)
-
-# Truncated Back-Propagation Through Time (TBPTT)
-tbptt_window: 12           # TBPTT window size (prevents gradient vanishing, speeds up training)
-syn_tau: 50.0              # Synaptic filter time constant (INCREASED for smoothing)
-
-# Surrogate Gradient
-surrogate_alpha: 15.0      # Surrogate gradient slope (REDUCED for smoother gradients)
-
-# SNN Health and Sparsity Control - USING ADAPTIVE THRESHOLDS (not sparsity loss)
-# spike_sparsity_weight: 20.0           # Strong sparsity enforcement (DISABLED - overwhelming the model)
-target_spike_rate: 0.075              # Target spike rate for healthy SNN (7.5%)
-spike_rate_tolerance: 0.02           # Allow ±2% deviation from target (tightened)
-max_spike_rate: 0.10                 # Healthy upper bound for spike rate (10%)
-min_spike_rate: 0.05                 # Healthy lower bound for spike rate (5%)
-fine_max_spike_rate: 0.15           # Fine spike rate upper bound (15%)
-fine_min_spike_rate: 0.03           # Fine spike rate lower bound (3%)
-membrane_leak: 0.9                   # Higher membrane potential decay (INCREASED for health)
-reset_potential: 0.0                 # Reset potential after spike
-
-# High Spike Rate Layer Control - USING ADAPTIVE THRESHOLDS AND SCALING
-# high_spike_sparsity_weight: 25.0     # Higher weight for problematic layers (DISABLED - using adaptive thresholds)
-target_low_spike_rate: 0.03          # MUCH lower target for problematic layers (3% instead of 5%)
-action_logits_target_rate: 0.1       # Much lower target for action_logits (10% instead of 20%)
-# Layer-specific scaling factors - RESET to let AdaptiveLIF handle spike control
-global_features_scale: 1.0           # RESET: Increase from 0.02 - let LIF node control firing rate
-snn_output_scale: 1.0                # RESET: Increase from 0.02 - let LIF node control firing rate  
-action_logits_scale: 1.0             # RESET: Increase from 0.5 - let LIF node control firing rate
-
-# Adaptive threshold parameters for maintaining health
-use_adaptive_threshold: true         # Enable adaptive thresholds
-threshold_adaptation_rate: 0.01      # Faster threshold adaptation (INCREASED)
-target_utilization: 0.1              # Target neuron utilization rate (REDUCED for health)
-
-# Gate Thresholds for SNN Framework
-conflict_gate_threshold: 1.6         # Conflict detection threshold - DOUBLED from 0.8 for much less sensitivity
-hesitation_gate_threshold: 0.30      # Hesitation threshold - DOUBLED from 0.15
-confidence_threshold: 1.8            # Confidence threshold for decisions - DOUBLED from 0.9
-danger_threshold: 1.6                # Threshold for danger pattern detection - DOUBLED from 0.8
-danger_gate_strength: 2.4            # How strongly danger gates inhibit actions - DOUBLED from 1.2
-danger_sensitivity: 2.6              # Sensitivity multiplier for danger detection - DOUBLED from 1.3
-momentum_alignment_threshold: 1.8     # Threshold for momentum alignment with goal - DOUBLED from 0.9
-safe_region_threshold: 1.9          # Threshold for considering region safe - DOUBLED from 0.95
-
-# SNN Neuron Scaling (multipliers on lif_tau and lif_v_threshold)
-lif_scale_conv1: 1.2        # DOUBLED from 1.1 to reduce spike rate
-lif_scale_conv2: 1.4        # DOUBLED from 1.2 to reduce spike rate
-lif_scale_conv3: 1.2        # DOUBLED from 1.1 to reduce spike rate
-lif_scale_feedback: 1.5     # DOUBLED from 1.5 to reduce spike rate
-lif_scale_attention: 2.0    # DOUBLED from 2.0 to reduce spike rate
-lif_scale_conv4: 0.8        # DOUBLED from 0.4 to reduce spike rate
-
-# Framework SNN specific scaling factors
-lif_tau_hesitation_scale: 3.0       # Hesitation LIF tau multiplier - DOUBLED from 1.5
-lif_tau_conflict_scale: 1.0         # Conflict LIF tau multiplier - DOUBLED from 0.5
-lif_tau_temporal_scale: 2.4         # Temporal LIF tau multiplier - DOUBLED from 1.2
-lif_threshold_hesitation_scale: 1.6  # Hesitation LIF threshold multiplier - DOUBLED from 0.8
-lif_threshold_conflict_scale: 12.0   # Conflict LIF threshold multiplier - DOUBLED AGAIN from 6.0
-lif_threshold_local_decision_scale: 8.0  # Local decision LIF threshold multiplier - DOUBLED AGAIN from 4.0
-
-# Spike sparsity parameters
-spike_active_threshold: 1.0          # Threshold for considering neurons active - DOUBLED from 1.0
-model_output_spike_threshold: 0.05    # Threshold for model output spike detection (increased to 1.0 to lower spike rate)
-proximity_threshold_hardcoded: 3.0   # Hardcoded proximity threshold - DOUBLED from 3.0
-
-# Spike sparsity regularization - DISABLED (using adaptive thresholds instead)
-# spike_sparsity_weight: 20.0          # Weight for spike sparsity loss (DISABLED - overwhelming the model)
-# spike_sparsity_target: 0.05          # Target spike rate (5% firing rate for sparsity) - DISABLED
-# spike_sparsity_tolerance: 0.01       # Tolerance around target spike rate - DISABLED
-# use_spike_sparsity_loss: false       # Disable spike sparsity regularization
-
-# SNN health monitoring parameters
-min_healthy_spike_rate: 0.05         # Minimum spike rate for healthy neurons
-max_healthy_spike_rate: 0.15         # Maximum spike rate for healthy neurons (REDUCED from 0.25)
-spike_rate_variance_threshold: 0.02  # Minimum variance in spike rates for learning
-health_score_spike_weight: 0.6       # Weight of spike rates in health score (INCREASED)
-health_score_variance_weight: 0.4    # Weight of variance in health score (DECREASED)
-
-# Entropy decay parameters
-entropy_decay_exponential_base: 0.1   # Base for exponential decay (0.1)
-entropy_decay_fast_exponential_base: 0.01  # Base for fast exponential decay (0.01)
-entropy_decay_cosine_multiplier: 0.5  # Multiplier for cosine decay (0.5)
-
-# Loss computation scaling factors
-proximity_reward_scale: 5.0        # Multiplier for proximity reward (BALANCED from 10000.0)
-communication_weight_scale: 5.0    # Multiplier for communication weight in high density
-coordination_weight_scale: 5.0     # Multiplier for coordination weight in high density  
-close_stress_bonus_per_agent: 0.7  # Bonus per very close agent
-stress_intensity_multiplier: 0.4   # Multiplier for stress intensity calculation
-stress_intensity_max: 0.7          # Maximum stress intensity value
-stress_bonus_exponent: 3         # Exponent for stress intensity in stay bonus
-movement_penalty_multiplier: 0.5   # Multiplier for movement penalty in inhibition loss
-
-# =============================================================================
-# BALANCED LOSS AND REWARD WEIGHTS
-# All weights balanced to similar scales (~1.0 to ~10.0) for comparable effects
-# =============================================================================
-
-# Communication and Coordination Losses (increased 10x from STDP)
-communication_weight: 50.0       # Agent communication loss weight (10x increase)
-coordination_weight: 50.0        # Agent coordination loss weight (10x increase)
-temporal_consistency_weight: 3.0 # Temporal consistency loss weight
-
-# Movement Penalty Weights (reduced from 1000.0 to ~5.0-10.0)
-oscillation_penalty_weight: 8.0      # Oscillation detection penalty (reduced from 1000.0)
-distance_away_penalty_weight: 10.0   # Moving away from goal penalty (reduced from 1000.0)
-distance_away_penalty_min_weight: 2.0 # Minimum distance penalty (reduced from 50.0)
-distance_away_penalty_decay_rate: 0.95 # Decay rate for distance penalty
-
-# Goal-Seeking Reward Weights (adjusted to ~3.0-8.0)
-direct_distance_reward_weight: 8.0   # Direct distance to goal reward (reduced from 100.0)
-progress_shaping_weight: 5.0         # Progress shaping reward weight (-Δ distance to goal)
-incremental_reward_weight: 3.0       # Incremental movement rewards (increased from 0.1)
-
-# Collision Loss Weights (increased to ~5.0-8.0)  
-collision_loss_weight: 6.0           # Overall collision loss scaling
-vertex_collision_weight: 5.0         # Vertex collision penalty (increased from 1.0)
-edge_collision_weight: 3.0           # Edge collision penalty (increased from 0.5)
-collision_threshold: 2.0             # Distance threshold for collision penalty
-use_continuous_collision: true       # Use continuous collision penalty
-
-# Stress and Attention Weights (increased to ~3.0-8.0)
-stress_inhibition_weight: 6.0        # Stress inhibition loss (increased from 0.5)
-selective_movement_weight: 4.0       # Selective movement loss (increased from 0.8)
-
-# Exploration and Learning Weights (adjusted to ~2.0-5.0)
-entropy_bonus_weight: 4.0            # Entropy bonus for exploration (increased from 2.0)
-entropy_bonus_epochs: 8              # Number of epochs with entropy bonus
-use_entropy_bonus: true              # Enable entropy bonus
-
-# Stay Action Penalty (moderate level ~3.0-5.0)
-stay_penalty_weight: 4.0             # Consecutive stay action penalty
-
-# Spike Regularization - DISABLED (using adaptive thresholds instead)
-# spike_sparsity_weight: 20.0           # Spike sparsity regularization (DISABLED - overwhelming the model)
-
-# STDP and Coordination Rewards (10x increase for coordination)
-stdp_reward_weight: 30.0              # STDP coordination reward weight (10x increase)
-proximity_reward_scale: 5.0          # Proximity reward scaling (reduced from 10000.0)
-
-# =============================================================================
-# RECURRENT AND GRAPH PARAMETERS
-# =============================================================================
-
-# Recurrent Connections
-recurrence_weight: 0.4    # Previous hidden state influence
-input_weight: 0.6         # Current input influence
-
-# Dynamic Graph Parameters
-proximity_threshold: 7  # Agent proximity threshold for connections in grid space (Manhattan distance)
-graph_proximity_threshold: 0.3  # Neural network graph connection threshold (feature space)
-max_connections: 5        # Maximum connections per agent
-edge_learning_rate: 2e-5   # Edge weight adaptation rate
-
-# Graph SNN Decision Making
-hesitation_weight: 0.05     # Decision hesitation factor - KEPT SAME as requested
-communication_weight: 50.0  # Agent communication influence (10x increase for STDP)
-
-# =============================================================================
-# TRANSFORMER PARAMETERS
-# =============================================================================
-
-# Basic Transformer
-transformer_nhead: 8       # Number of attention heads (must divide hidden_dim=128)
-transformer_ff_dim: 256    # Feedforward dimension
-transformer_layers: 2      # Number of transformer layers
-transformer2_layers: 1     # Second transformer layers
-
-# Enhanced Transformer Encoder
-use_transformer_encoder: true
-encoder_nhead: 8           # Encoder attention heads
-encoder_layers: 2          # Encoder layers
-encoder_dropout: 0.1       # Encoder dropout
-
-# Spiking Transformer
-use_spiking_transformer: true
-transformer_nhead: 8       # Spiking transformer heads
-transformer_ff_dim: 512    # Spiking transformer feedforward
-
-# Collision Loss Curriculum Learning
-use_collision_curriculum: true        # Enable curriculum learning for collision loss
-collision_curriculum_epochs: 20       # Number of epochs for curriculum (gradual increase)
-collision_curriculum_start_ratio: 0.1 # Starting ratio of full collision loss weight (10% of final weight)
-
-# Entropy Bonus for Exploration
-use_entropy_bonus: true               # Enable entropy bonus to encourage exploration
-entropy_bonus_weight: 4.0             # Weight for entropy bonus (balanced from 15.0)
-entropy_bonus_epochs: 8               # Number of epochs to apply entropy bonus (reduced from 80)
-entropy_bonus_decay_type: 'cosine'    # Decay type: 'linear', 'exponential', or 'cosine'
-
-# Goal Progress Reward (Best-Distance-So-Far System)
-use_goal_progress_reward: true        # Enable goal progress reward - rewards only new progress towards goals
-goal_progress_weight: 3.0             # Weight for goal progress reward (balanced from 1.0)
-goal_success_threshold: 1.1          # Distance threshold to consider agent has reached goal
-goal_tolerance: 0.9                  # Distance considered "reached goal" for progressive rewards
-progressive_goal_weight: 5.0         # Weight for progressive goal rewards (balanced from 500.0)
-
-# Direct Distance Reward (Make goal-seeking balanced)
-use_direct_distance_reward: true      # Enable direct distance-based reward (closer to goal = higher reward)
-direct_distance_reward_weight: 8.0    # Weight for direct distance reward (balanced from 100.0)
-
-# Distance-Away Penalty (balanced penalty for moving away from goal)
-use_distance_away_penalty: true       # Enable penalty for moving away from goal
-distance_away_penalty_weight: 6.0     # Initial penalty weight for moving away from goal (balanced from 1000.0)
-distance_away_penalty_decay_rate: 0.95 # Decay rate per epoch
-distance_away_penalty_min_weight: 2.0  # Minimum penalty weight (balanced from 50.0)
-
-# Incremental Reward Parameters  
-incremental_reward_weight: 4.0        # Weight for incremental movement rewards (balanced from 50.0)
-
-# Progress Shaping Reward (Numerical Stability)
-use_progress_shaping_reward: true     # Enable progress shaping reward -Δ(distance-to-goal) each step
-progress_shaping_weight: 5.0          # Weight for progress shaping reward (increased from 2.0 for balance)
-
-# Obstacle-Aware Progress Reward Parameters
-danger_zone_radius: 2.0              # Radius around obstacles considered dangerous
-danger_penalty_weight: 3.0           # Weight for danger zone penalty (increased from 2.0 for balance)
-
-# Stay Action Reward (Conservative Behavior)
-use_stay_action_reward: false        # DISABLE stay action reward to encourage movement towards goals
-stay_action_reward_weight: 0.01      # Weight for stay action reward
-
-# =============================================================================
-# COLLISION LOSS PARAMETERS
-# =============================================================================
-
-# Collision Detection
-use_collision_loss: true
-collision_loss_weight: 6.0      # Weight for collision penalty (balanced from 5000.0)
-collision_loss_type: 'l2'       # Loss type: 'l1', 'l2', or 'exponential'
-collision_detection_radius: 1   # Collision detection radius
-
-# Collision Types
-vertex_collision_weight: 5.0    # Same position collisions (balanced from 3000)
-edge_collision_weight: 3.0      # Swapping position collisions (balanced from 3000)
-
-# Per-Agent Collision Loss
-per_agent_collision_loss: true  # Enable per-agent collision loss for individual learning
-
-# Continuous Collision Loss (Numerical Stability)
-use_continuous_collision: true  # Use continuous inverse Manhattan distance instead of binary collision
-collision_threshold: 2.0        # Distance threshold for continuous collision penalty (agents < 2 cells apart)
-
-# Future Collision Prediction
-use_future_collision_penalty: true
-future_collision_steps: 2      # Steps ahead to predict
-future_collision_weight: 4.0        # Future collision penalty weight (balanced from 3000)
-future_step_decay: 0.8         # Decay for distant future steps
-future_blend_factor: 1       # Blend factor for combining real and future losses (0.0 = real only, 1.0 = equal weight)
-separate_collision_types: true # Separate real vs future collision handling (cleaner signal)
-
-# =============================================================================
-# STDP SPATIAL DANGER DETECTION PARAMETERS
-# =============================================================================
-
-# STDP Spatial Danger Detection
-use_stdp_spatial_detector: true   # Enable STDP-based spatial danger detection
-stdp_feature_channels: 32         # Number of feature channels in STDP layers
-stdp_kernel_size: 3               # Kernel size for STDP convolution layers
-
-# STDP Learning Parameters
-enable_stdp_learning: true        # Enable STDP learning during training
-stdp_tau_pre: 20.0               # Pre-synaptic trace time constant
-stdp_tau_post: 20.0              # Post-synaptic trace time constant
-stdp_lr_pre: 1e-5                # Pre-synaptic learning rate
-stdp_lr_post: 1e-5               # Post-synaptic learning rate
-
-# Danger Decoder Parameters
-enable_danger_inhibition: true   # Enable danger-based action inhibition
-
-# =============================================================================
-# HARD INHIBITION PARAMETERS
-# =============================================================================
-
-# Hard Inhibition Thresholds
-conflict_gate_threshold: 0.8     # Threshold for conflict detection - INCREASED to 0.8 for much much less sensitivity
-hesitation_gate_threshold: 0.15  # Threshold for hesitation detection - KEPT SAME as requested
-
-# =============================================================================
-# STRESS INHIBITION MECHANISM PARAMETERS
-# =============================================================================
-
-# Stress Detection and Inhibition
-use_stress_inhibition: true        # Enable stress inhibition mechanism
-stress_inhibition_weight: 3.0      # Weight for stress inhibition loss (balanced from 0.2)
-stress_radius: 1.5                 # Radius for detecting high-stress zones
-min_stress_agents: 3               # Minimum agents needed to trigger stress
-
-# Selective Movement in Stress Zones
-selective_movement_weight: 4.0     # Weight for selective movement coordination (balanced from 0.8)
-stress_stay_preference: 2.0        # Multiplier for stay action preference in stress zones
-
-# =============================================================================
-# STDP COORDINATION SYSTEM PARAMETERS
-# =============================================================================
-
-# STDP Coordination System
-use_stdp_coordination: true         # Enable STDP-based coordination system
-stdp_coordination_weight: 30.0      # Weight for STDP coordination loss (10x increase)
-
-# STDP Facilitation Parameters
-stdp_tau_facilitation: 30.0         # Time constant for facilitation traces (longer memory)
-stdp_tau_inhibition: 20.0          # Time constant for inhibition traces (shorter memory)
-stdp_lr_facilitation: 2e-5         # Learning rate for facilitation updates
-stdp_lr_inhibition: 3e-5           # Learning rate for inhibition updates
-
-# Agent Momentum Tracking
-momentum_decay: 0.8                 # Decay factor for agent momentum vectors
-
-# Safety Region Detection
-collision_history_window: 30        # Window size for collision history tracking
-
-# Dynamic Coordination
-coordination_radius: 3.0            # Radius for inter-agent coordination
-flow_field_strength: 0.5            # Strength of intention flow field influence
-
-# =============================================================================
-# ENHANCED OSCILLATION DETECTION PARAMETERS
-# =============================================================================
-
-# Enhanced Oscillation Detection
-use_enhanced_oscillation_detection: true  # Enable enhanced oscillation detection
-oscillation_penalty_weight: 7.0           # Base oscillation penalty weight (balanced from 1000.0)
-oscillation_history_length: 8             # Maximum positions to track per agent
-oscillation_min_cycle_length: 2           # Minimum cycle length to detect (A<->B)
-oscillation_max_cycle_length: 6           # Maximum cycle length to detect
-oscillation_stagnation_radius: 1.5        # Radius for stagnation detection
-oscillation_stagnation_threshold: 0.7     # Fraction of moves within radius for stagnation
-oscillation_enable_diagnostics: true      # Enable oscillation diagnostics logging
-
-# =============================================================================
+  batch_size: 4
+  num_workers: 0
+lif_tau: 4.0
+lif_v_threshold: 0.6
+lif_tau_scale_embedding: 1.0
+lif_tau_scale_attention1: 2.0
+lif_tau_scale_feature_net: 3.0
+lif_tau_scale_node_processor: 3.0
+lif_tau_scale_edge_processor: 3.0
+lif_tau_scale_message_net: 3.0
+lif_tau_scale_output_net: 3.0
+lif_tau_scale_output_layer: 3.0
+lif_threshold_scale_embedding: 1.0
+lif_threshold_scale_attention1: 0.2
+lif_threshold_scale_feature_net: 0.2
+lif_threshold_scale_node_processor: 0.2
+lif_threshold_scale_edge_processor: 0.2
+lif_threshold_scale_message_net: 0.2
+lif_threshold_scale_output_net: 0.2
+lif_threshold_scale_output_layer: 0.2
+output_scale_embedding: 2.0
+output_scale_attention1: 4.0
+output_scale_feature_net: 6.0
+output_scale_node_processor: 8.0
+output_scale_edge_processor: 6.0
+output_scale_message_net: 8.0
+output_scale_output_net: 10.0
+output_scale_output_layer: 4.0
+input_scale: 20.0

@@ -1,11 +1,3 @@
-*.vscode
-*_pycache_
-*dataset
+__pycache__/
 *.pyc
-*results
-*continous/
-*other/
-*journal.md
-*testbed.py
-*.pyc
-trained_modelstrained_models/
+dataset/
