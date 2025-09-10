@@ -1,0 +1,120 @@
+# ===============================
+# SNN MAPF Configuration File - CLEANED
+# Contains only parameters actually used in the code
+# ===============================
+
+# =============================================================================
+# TRAINING PARAMETERS
+# =============================================================================
+
+# Basic Training
+epochs: 100
+device: 'auto'                     # Auto-detects best device (CPU/GPU/Multi-GPU)
+use_amp: true                      # Automatic Mixed Precision (auto-enabled on GPU)
+
+# Gradient Stabilization (CRITICAL for preventing explosion without affecting spikes)
+gradient_clip_norm: 0.1        # ULTRA AGGRESSIVE: Clip gradients to max norm=0.1
+gradient_clip_value: 0.05      # ULTRA AGGRESSIVE: Clip individual gradient values to 0.05
+use_gradient_scaling: true     # Enable gradient scaling for stability
+loss_scale_factor: 0.01        # AGGRESSIVE: Scale down loss significantly (1/100)
+use_nan_protection: true       # Enable NaN/inf protection
+
+# Reward/Punishment Magnitudes (used in train_neuromod.py)
+goal_reward: 10.0
+collision_punishment: -8.0
+step_penalty: -0.5
+cooperation_bonus: 3.0
+reward_decay: 0.95
+trace_length: 10
+
+# Neuromodulator Scaling (used in train_neuromod.py)
+reward_scale: 0.2
+punishment_scale: 0.2
+
+# Expert Training (used in train_neuromod.py)
+expected_expert_trajectory_length: 16
+
+# =============================================================================
+# DATA LOADING (used in train_neuromod.py)
+# =============================================================================
+
+# Dataset Configuration
+train:
+  root_dir: 'dataset/5_8_28'
+  mode: 'train'
+  min_time: 4
+  max_time_dl: 60
+  nb_agents: 5
+  batch_size: 16
+  num_workers: 3
+
+valid:
+  root_dir: 'dataset/5_8_28'
+  mode: 'valid'
+  min_time: 4
+  max_time_dl: 60
+  nb_agents: 5
+  batch_size: 8
+  num_workers: 0
+
+# Visualization Settings (used in train_neuromod.py)
+enable_visualization: true
+
+# Data Loader Settings (used in train_neuromod.py)
+sequence_length: 100
+num_workers: 3
+
+# =============================================================================
+# ENVIRONMENT PARAMETERS (used in train_neuromod.py)
+# =============================================================================
+
+# Simulation Environment
+board_size: [9, 9]
+
+# =============================================================================
+# SNN ARCHITECTURE PARAMETERS (used in framework_snn.py)
+# =============================================================================
+
+# Model Dimensions (used in framework_snn.py)
+input_dim: 147
+hidden_dim: 128
+num_actions: 5
+num_agents: 5
+
+# SNN Neuron Parameters (used in framework_snn.py)
+lif_tau: 4.0              # MODERATE: Balanced membrane time constant
+lif_v_threshold: 0.6      # MODERATE: Balanced threshold
+
+# Layer-specific scaling parameters (CONSERVATIVE - small progressive changes)
+# Tau scaling (slight increase each layer for temporal memory)
+lif_tau_scale_embedding: 1.0       # Layer 1: base tau (4.0)
+lif_tau_scale_attention1: 2.0      # Layer 2: tau=4.2
+lif_tau_scale_feature_net: 3.0     # Layer 3: tau=4.4
+lif_tau_scale_node_processor: 3.0  # Layer 4: tau=4.6 (recurrent)
+lif_tau_scale_edge_processor: 3.0  # Layer 5: tau=4.8
+lif_tau_scale_message_net: 3.0     # Layer 6: tau=5.0 (recurrent)
+lif_tau_scale_output_net: 3.0      # Layer 7: tau=5.2 (recurrent)
+lif_tau_scale_output_layer: 3.0    # Layer 8: tau=5.4
+
+# Threshold scaling (slight decrease each layer for easier propagation)
+lif_threshold_scale_embedding: 1.0     # Layer 1: threshold=0.6
+lif_threshold_scale_attention1: 0.2   # Layer 2: threshold=0.57
+lif_threshold_scale_feature_net: 0.2   # Layer 3: threshold=0.54
+lif_threshold_scale_node_processor: 0.2 # Layer 4: threshold=0.51 (recurrent)
+lif_threshold_scale_edge_processor: 0.2  # Layer 5: threshold=0.48
+lif_threshold_scale_message_net: 0.2    # Layer 6: threshold=0.45 (recurrent)
+lif_threshold_scale_output_net: 0.2    # Layer 7: threshold=0.42 (recurrent)
+lif_threshold_scale_output_layer: 0.2   # Layer 8: threshold=0.39
+
+# Output scaling (boost signal propagation between layers)
+output_scale_embedding: 2.0        # Layer 1: 2x boost (increased from 1.0)
+output_scale_attention1: 4.0       # Layer 2: 4x boost to propagate through attention (increased from 2.0)
+output_scale_feature_net: 6.0      # Layer 3: 6x boost to drive graph processing (increased from 3.0)
+output_scale_node_processor: 8.0   # Layer 4: 8x boost for node processing (recurrent) (increased from 4.0)
+output_scale_edge_processor: 6.0   # Layer 5: 6x boost for edge processing (increased from 3.0)
+output_scale_message_net: 8.0      # Layer 6: 8x boost for message propagation (recurrent) (increased from 4.0)
+output_scale_output_net: 10.0      # Layer 7: 10x boost to drive final output (recurrent) (increased from 5.0)
+output_scale_output_layer: 4.0     # Layer 8: 4x boost for final actions (increased from 2.0)
+
+# Input Processing (used in framework_snn.py)
+input_scale: 20.0         # INCREASED: Higher input scaling for better initial spike generation (doubled from 10.0)
