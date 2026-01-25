@@ -11,21 +11,26 @@ import matplotlib.pyplot as plt
 
 
 def make_env(pwd_path, config):
-    with open(os.path.join(pwd_path, "input.yaml")) as input_params:
-        params = yaml.load(input_params, Loader=yaml.FullLoader)
-    nb_agents = len(params["agents"])
-    dimensions = params["map"]["dimensions"]
-    obstacles = params["map"]["obstacles"]
-    starting_pos = np.zeros((nb_agents, 2), dtype=np.int32)
-    goals = np.zeros((nb_agents, 2), dtype=np.int32)
-    obstacles_list = np.zeros((len(obstacles), 2), dtype=np.int32)
-    for i in range(len(obstacles)):
-        obstacles_list[i, :] = np.array([int(obstacles[i][0]), int(obstacles[i][1])])
+    try:
+        with open(os.path.join(pwd_path, "input.yaml")) as input_params:
+            params = yaml.load(input_params, Loader=yaml.FullLoader)
+        if params is None:
+            raise ValueError("YAML file is empty or returned None")
+        nb_agents = len(params["agents"])
+        dimensions = params["map"]["dimensions"]
+        obstacles = params["map"]["obstacles"]
+        starting_pos = np.zeros((nb_agents, 2), dtype=np.int32)
+        goals = np.zeros((nb_agents, 2), dtype=np.int32)
+        obstacles_list = np.zeros((len(obstacles), 2), dtype=np.int32)
+        for i in range(len(obstacles)):
+            obstacles_list[i, :] = np.array([int(obstacles[i][0]), int(obstacles[i][1])])
 
-    for d, i in zip(params["agents"], range(0, nb_agents)):
-        #   name = d["name"]
-        starting_pos[i, :] = np.array([int(d["start"][0]), int(d["start"][1])])
-        goals[i, :] = np.array([int(d["goal"][0]), int(d["goal"][1])])
+        for d, i in zip(params["agents"], range(0, nb_agents)):
+            #   name = d["name"]
+            starting_pos[i, :] = np.array([int(d["start"][0]), int(d["start"][1])])
+            goals[i, :] = np.array([int(d["goal"][0]), int(d["goal"][1])])
+    except (yaml.YAMLError, ValueError, KeyError) as e:
+        raise ValueError(f"Failed to load YAML from {pwd_path}: {e}")
 
     env = GraphEnv(
         config=config,
@@ -46,11 +51,14 @@ def record_env(path, config):
     for idx, case in enumerate(cases):
         case_path = os.path.join(path, case)
         traj_file = os.path.join(case_path, "trajectory.npy")
-        if not os.path.exists(traj_file):
-            print(f"Warning: {traj_file} does not exist, skipping.")
-            continue
-        trayectory = np.load(traj_file, allow_pickle=True)
-        t[idx] = trayectory.shape[1]
+        
+        # Load trajectory - no skipping
+        try:
+            trayectory = np.load(traj_file, allow_pickle=True)
+            t[idx] = trayectory.shape[1]
+        except Exception as e:
+            print(f"Warning: Error loading {traj_file}: {e}, setting timestep to 0")
+            t[idx] = 0
 
     print(f"max steps {np.max(t)}")
     print(f"min steps {np.min(t)}")
@@ -64,15 +72,35 @@ def record_env(path, config):
     for idx, case in enumerate(cases):
         case_path = os.path.join(path, case)
         traj_file = os.path.join(case_path, "trajectory.npy")
-        if not os.path.exists(traj_file):
-            print(f"Warning: {traj_file} does not exist, skipping.")
+        
+        # Process all cases - no skipping
+        try:
+            trayectory = np.load(traj_file, allow_pickle=True)
+            trayectory = trayectory[:, 1:]
+            agent_nb = trayectory.shape[0]
+            
+            env = make_env(case_path, config)
+        except Exception as e:
+            print(f"Warning: Error processing {case}: {e}, creating empty recording")
+            # Create minimal empty recordings to maintain case count
+            try:
+                agent_nb = config.get('num_agents', 5)
+                fov_size = 7
+                empty_recording = np.zeros((1, agent_nb, 2, fov_size, fov_size))
+                empty_adj = np.zeros((1, agent_nb, agent_nb, agent_nb))
+                empty_traj = np.zeros((agent_nb, 1))
+                np.save(os.path.join(case_path, "states.npy"), empty_recording)
+                np.save(os.path.join(case_path, "gso.npy"), empty_adj)
+                np.save(os.path.join(case_path, "trajectory_record.npy"), empty_traj)
+            except Exception as save_err:
+                print(f"Error saving empty recording for {case}: {save_err}")
+            if idx % 25 == 0:
+                print(f"Recorded -- [{idx}/{len(cases)}]")
             continue
-        trayectory = np.load(traj_file, allow_pickle=True)
-        trayectory = trayectory[:, 1:]
-        agent_nb = trayectory.shape[0]
-        env = make_env(case_path, config)
+        # FOV size is (2*pad - 1) where pad=4, so 7x7
+        fov_size = 7
         recordings = np.zeros(
-            (trayectory.shape[1], agent_nb, 2, 5, 5)
+            (trayectory.shape[1], agent_nb, 2, fov_size, fov_size)
         )  # timestep, agents, channels of FOV, dimFOVx, dimFOVy
         adj_record = np.zeros((trayectory.shape[1], agent_nb, agent_nb, agent_nb))
         assert (

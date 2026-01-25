@@ -22,3 +22,20 @@ def build_optimizer(model,cfg):
     elif sched_cfg.get('type')=='step':
         scheduler=torch.optim.lr_scheduler.StepLR(opt,step_size=sched_cfg.get('step_size',50),gamma=sched_cfg.get('gamma',0.5))
     return opt,scheduler
+
+def setup_training_optimizer(model, cfg):
+    """Setup optimizer for training - used by train_neuromod.py"""
+    # Use default learning rate for neuromodulated training
+    lr = cfg.get('learning_rate', 1e-3)
+    weight_decay = cfg.get('weight_decay', 1e-5)
+    
+    # Create Adam optimizer with default settings suitable for SNN training
+    optimizer = torch.optim.Adam(
+        model.parameters(),
+        lr=lr,
+        weight_decay=weight_decay,
+        betas=(0.9, 0.999),
+        eps=1e-8
+    )
+    
+    return optimizer

@@ -1,97 +1,58 @@
-import argparse
-import yaml
-import torch
-import os
-from pathlib import Path
+import yaml, torch
 
-def load_config(config_path=None):
-    """
-    Load configuration from a YAML file.
-    
-    Args:
-        config_path (str, optional): Path to the YAML configuration file.
-                                   If None, uses default from command line args.
-    
-    Returns:
-        dict: Configuration dictionary
-    """
-    if config_path is None:
-        parser = argparse.ArgumentParser(description="Global configuration")
-        parser.add_argument(
-            '--config',
-            type=str,
-            default="configs/config_snn.yaml",
-            help="Path to the YAML configuration file"
-        )
-        args, _ = parser.parse_known_args()
-        config_path = args.config
-    
-    # Make path relative to this script's directory
-    script_dir = Path(__file__).parent
-    if not os.path.isabs(config_path):
-        config_path = script_dir / config_path
-    
-    with open(config_path, 'r') as f:
-        config = yaml.safe_load(f)
-    
-    # Global device assignment
-    config['device'] = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-    
-    return config
+def load_config(path=None):
+    cfg_path = path
+    if cfg_path is None:
+        raise ValueError('Path must be provided to load_config in clean release')
+    with open(cfg_path,'r') as f: cfg=yaml.safe_load(f)
+    cfg['device']= 'cuda' if torch.cuda.is_available() else 'cpu'
+    return cfg
 
-# Global configuration loader for backward compatibility
+# Provide a module-level default config if desired; not auto-parsing CLI here to keep minimal.
 try:
-    parser = argparse.ArgumentParser(description="Global configuration")
-    parser.add_argument(
-        '--config',
-        type=str,
-        default="configs/config_snn.yaml",
-        help="Path to the YAML configuration file"
-    )
-    args, _ = parser.parse_known_args()
-
-    # Try to load config, with fallback to create default
-    script_dir = Path(__file__).parent
-    config_path = script_dir / args.config
-    
-    if config_path.exists():
-        config = load_config(str(config_path))
-        print(f"✅ Config loaded from: {config_path}")
-    else:
-        # Create minimal default config
-        print(f"⚠️  Config file not found at {config_path}, using defaults")
-        config = {
-            'device': torch.device("cuda:0" if torch.cuda.is_available() else "cpu"),
-            'batch_size': 8,
-            'epochs': 100,
-            'sequence_length': 100,
-            'board_size': [9, 9],
-            'use_amp': True,
-            'gradient_clip_norm': 0.1,
-            'gradient_clip_value': 0.05,
-            'use_gradient_scaling': True,
-            'loss_scale_factor': 0.01,
-            'use_nan_protection': True,
-            'goal_reward': 10.0,
-            'collision_punishment': -8.0,
-            'step_penalty': -0.5,
-            'cooperation_bonus': 3.0,
-            'reward_decay': 0.95,
-            'trace_length': 10,
-            'reward_scale': 0.2,
-            'punishment_scale': 0.5
-        }
-        
-except Exception as e:
-    print(f"⚠️  Error loading config: {e}, using minimal defaults")
+    config = load_config('configs/config_snn.yaml')
+except FileNotFoundError:
+    # Fallback basic config for clean operation
     config = {
-        'device': torch.device("cuda:0" if torch.cuda.is_available() else "cpu"),
+        'device': 'cuda' if torch.cuda.is_available() else 'cpu',
+        'epochs': 50,
         'batch_size': 8,
-        'epochs': 100,
+        'learning_rate': 1e-4,  # Reduced by 10x from 1e-3
+        'weight_decay': 1e-5,
         'sequence_length': 100,
         'board_size': [9, 9],
-        'use_amp': True
+        'num_actions': 5,
+        'num_agents': 5,
+        'hidden_dim': 128,
+        'input_dim': 147,
+        'reward_scale': 0.001,       # ULTRA reduced - avg reward was still 26-30!
+        'punishment_scale': 0.15,    # Increase punishment scale for better balance
+        'goal_reward': 100.0,         # HUGE reward boost for reaching goal
+        'collision_punishment': -3.0,  # 10x INCREASED from -0.3 (strong collision penalty)
+        'step_penalty': -1.0,        # 10x INCREASED from -0.1 (strong step penalty)
+        'cooperation_bonus': 1.0,
+        
+        # Spike rate penalty parameters - NEW!
+        'spike_rate_penalty': -2.0,  # Penalty when spike rate falls below threshold
+        'min_spike_rate_threshold': 0.03,  # 3% minimum spike rate threshold
+        
+        # High spike activity penalties - NEW!
+        'high_spike_penalty': -1.5,  # REDUCED from -3.0 - Gentler penalty for excessive spiking
+        'max_spike_rate_threshold': 0.15,  # 15% maximum spike rate threshold
+        'reward_reduction_factor': 0.7,  # INCREASED from 0.5 - Less aggressive reward reduction
+        
+        'reward_decay': 0.95,
+        'trace_length': 13,
+        
+        # Entropy regularization for exploration
+        'entropy_coefficient': 0.5,  # 100x INCREASED from 0.01 - Strong exploration bonus
+        
+        # Activity regularization to prevent neuron death
+        'activity_regularization_strength': 0.01,  # REDUCED from 0.05 - Looser activity regularization
+        
+        # Input noise for early training epochs
+        'input_noise_level': 0.01,  # Gaussian noise added to FOV inputs during first 5 epochs
+        
+        # Reward scaling for gradient stability (HIGHEST PRIORITY FIX)
+        'reward_scale_factor': 20.0,  # Divide raw rewards by this to prevent gradient explosion
     }
-
-# Make config values easily accessible
-# e.g., config['lif_tau'], config['adapt_alpha'], etc.
