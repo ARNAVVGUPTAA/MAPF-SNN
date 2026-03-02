@@ -877,9 +877,9 @@ If you use this code in your research, please cite:
 ```bibtex
 @misc{mapf_neuromorphic_lsm_2026,
   title={BDSM: Brains Don't Simply Multiply - Neuromorphic LSM for MAPF},
-  author={Your Name},
+  author=Arnav Gupta,
   year={2026},
-  url={https://github.com/yourusername/MAPF-GNN}
+  url={https://github.com/ARNAVVGUPTAA/MAPF-SNN}
 }
 ```
 
@@ -895,7 +895,7 @@ MIT License - see LICENSE file for details.
 
 For questions or issues:
 - Open an issue on GitHub
-- Email: your.email@example.com
+- Email: guptaa.arnavv0620@example.com
 
 ---
 
