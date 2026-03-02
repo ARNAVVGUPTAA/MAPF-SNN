@@ -1,8 +1,60 @@
+# Python
 __pycache__/
-*.pyc
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.ropeproject/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Project-specific
 dataset/
 checkpoints/
 logs/
+data/lsm/
+visualizations/
 *.log
 nohup.out
-.DS_Store
+
+# Backups
+*_backup.*
+*.bak
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# Model outputs
+*.pt
+*.pth
+*.ckpt
+!models/*.py
+
+# Data generation
+*.npz
+*.npy
+dataset_generation.log
+
+# Training artifacts
+*.png
+*.jpg
+*.gif
+liquid_reservoir_activity.png
+
+# Temporary
+tmp/
+temp/
+*.tmp

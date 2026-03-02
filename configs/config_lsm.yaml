@@ -1,0 +1,144 @@
+# ===================================================================
+# Liquid State Machine (LSM) Configuration for MAPF
+# ===================================================================
+# Cerebellum-inspired architecture:
+# - Large circular mesh with each node being a sub-mesh
+# - EILIF neurons: Excitatory (E) and Inhibitory (I) 
+# - E neurons: Connect to other meshes (forward processing)
+# - I neurons: Only inhibit within same mesh (prevent over-excitation)
+# - High density for rich dynamics
+# - Reservoir computing: Fixed random reservoir + trained readout
+# ===================================================================
+
+# Dataset Configuration
+dataset:
+  root_dir: "dataset/5_8_28"
+  train_split: 1.0  # Use all data for training (or set to 0.9 to reserve 10% for validation)
+  sequence_length: 50  # Max trajectory length to process
+  use_full_dataset: true  # Set to false to limit dataset size for testing
+
+# Environment
+board_size: [9, 9]
+num_actions: 5
+num_agents: 5
+fov_size: 7
+fov_channels: 2
+
+# LSM Architecture
+lsm:
+  # Main Reservoir Structure
+  num_meshes: 16  # Number of sub-meshes (like cortical columns or cerebellar modules)
+  neurons_per_mesh: 256  # Neurons in each mesh
+  total_reservoir_neurons: 4096  # num_meshes * neurons_per_mesh
+  
+  # EILIF Neuron Configuration
+  E_ratio: 0.8  # 80% excitatory, 20% inhibitory (biologically realistic)
+  v_threshold: 1.0  # Spike threshold (float version)
+  v_reset: 0.0  # Reset potential after spike
+  tau_E: 2.0  # Excitatory membrane time constant (ms)
+  tau_I: 1.5  # Inhibitory membrane time constant (ms) - faster for quick dampening
+  
+  # Neuromorphic Configuration (BDSM: BRAIN DON'T SIMPLY MULTIPLY!)
+  neuromorphic:
+    enabled: true  # Use neuromorphic-friendly operations with surrogate gradients
+    
+    # Weight Quantization (for hardware deployment)
+    weight_bits: 8  # Synaptic weight quantization (8 bits = 256 levels)
+    activation_bits: 16  # Membrane potential precision
+    
+    # Neuromorphic Operations
+    use_bit_shifts: true  # Use bit-shift decay (v = v - (v >> shift))
+    use_sparse_computation: true  # Event-driven (skip silent neurons)
+    
+    # Surrogate Gradients (enables training with SGD/BPTT)
+    surrogate_type: "fast_sigmoid"  # Options: fast_sigmoid, sigmoid, triangular, rectangular
+    surrogate_beta: 10.0  # Steepness of surrogate function (higher = sharper)
+    
+    # Quantization-Aware Training
+    quantize_weights: true  # Apply quantization during training
+    quantize_activations: false  # Keep activations float (for stability)
+  
+  # Connectivity Densities (INCREASED for rich dynamics)
+  intra_mesh_E_density: 0.5  # E->E connections within mesh (HIGH for recurrence)
+  intra_mesh_I_density: 0.7  # I->I connections within mesh (HIGH for competition)
+  E_to_I_density: 0.6  # E->I connections (drive inhibition)
+  I_to_E_density: 0.8  # I->E connections (lateral inhibition) - very strong
+  
+  # Inter-mesh connectivity (E neurons only connect between meshes)
+  inter_mesh_E_density: 0.2  # E neurons project to next mesh (INCREASED)
+  circular_topology: true  # Last mesh connects back to first (circular architecture)
+  skip_connections: true  # Allow skip connections between non-adjacent meshes
+  skip_density: 0.08  # Sparse long-range connections
+  
+  # Input Projection
+  input_projection_type: "specialized"  # "specialized" or "distributed"
+  # specialized: Each mesh gets specific input features
+  # distributed: All inputs broadcast to all meshes with random weights
+  
+  # Temporal Dynamics
+  num_ticks: 10  # Number of simulation timesteps per input (more = richer dynamics)
+  
+  # Weight Initialization
+  weight_scale_E: 0.5  # Excitatory weight magnitude
+  weight_scale_I: 1.0  # Inhibitory weight magnitude (stronger inhibition)
+  input_weight_scale: 0.8  # Input projection weight scale
+
+# Readout Configuration
+readout:
+  method: "ridge_regression"  # Linear readout with ridge regression
+  regularization: 1e-2  # Ridge regression lambda (L2 penalty)
+  rate_coding: true  # Use spike rate (accumulated spikes) as state
+  readout_from: "all_meshes"  # "all_meshes" or "last_mesh" or "selected_meshes"
+  
+  # For supervised learning from trajectory data
+  collect_episodes: 1000  # Number of expert episodes to collect liquid states from
+  validation_split: 0.1  # Reserve 10% for validation
+
+# Training Configuration
+training:
+  mode: "reservoir_computing"  # Options: "reservoir_computing", "end_to_end", "hybrid"
+  
+  # Reservoir Computing (default): Fixed reservoir + train readout only
+  train_reservoir: false  # Keep false for pure LSM
+  train_readout: true
+  
+  # End-to-End Training: Train entire network with SGD/BPTT using surrogate gradients
+  # (Requires neuromorphic.enabled=true for gradient flow)
+  end_to_end_epochs: 50  # If mode="end_to_end"
+  learning_rate: 1e-4
+  batch_size: 16
+  optimizer: "adam"  # adam, sgd, adamw
+  
+  # Hybrid Mode: Reservoir computing first, then fine-tune with SGD
+  fine_tune_reservoir: false  # Set true for hybrid mode
+  fine_tune_epochs: 10
+  fine_tune_lr: 1e-5
+
+# Evaluation Metrics
+evaluation:
+  metrics:
+    - "spike_rate"  # Average spike rate across reservoir
+    - "mesh_spike_rates"  # Individual mesh spike rates
+    - "collision_rate"  # Collision frequency
+    - "reach_rate"  # Success rate (reaching goals)
+    - "path_efficiency"  # Path length vs optimal
+    - "E_I_balance"  # Excitatory/Inhibitory balance
+    - "mesh_utilization"  # How many meshes are active
+  
+  test_episodes: 100  # Number of episodes for evaluation
+  visualize_reservoir: true  # Save visualization of reservoir activity
+  save_metrics: true  # Save detailed metrics to file
+
+# Logging
+logging:
+  log_dir: "logs/lsm"
+  save_checkpoints: true
+  checkpoint_dir: "checkpoints/lsm"
+  visualization_dir: "visualizations/lsm"
+  log_interval: 10  # Log metrics every N episodes
+  save_reservoir_states: false  # Save intermediate reservoir states (large files)
+
+# Hardware
+device: "cuda"  # Will auto-detect in code
+num_workers: 4  # DataLoader workers
+pin_memory: true
