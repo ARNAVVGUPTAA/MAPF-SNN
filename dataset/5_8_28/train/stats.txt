@@ -1,3 +1,3 @@
 max steps 18.0
 min steps 0.0
-mean steps 10.64016401640164
+mean steps 10.643664366436644

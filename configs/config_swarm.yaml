@@ -1,0 +1,41 @@
+# Hardware-Native Swarm LSM Configuration
+# =========================================
+# Three modules: Topographic Map + CPG + Shadow Caster
+# Pure spike routing. No matrix math.
+
+# Swarm
+swarm:
+  num_agents: 5
+  communication_range: 3.0  # Grid distance for neighbor detection
+
+# Training
+training:
+  max_episodes: 1000  # Liquid state collection episodes
+  test_episodes: 100  # Validation episodes
+  ridge_alpha: 0.75  # Ridge regression regularization
+  num_ticks: 30  # Number of simulation ticks per forward pass
+  optimizer: sgd  # "ridge" or "sgd"
+  sgd_epochs: 500
+  sgd_lr: 0.0001
+  sgd_batch_size: 128
+
+# Dataset - format for SNNDataset
+train:
+  root_dirs:
+    - "dataset/5_8_28"          # 9999 perfect CBS episodes
+    - "dataset/5_5_9_recovery"  # 500 recovery/noise episodes
+
+valid:
+  root_dirs:
+    - "dataset/5_8_28"          # use existing valid split
+    - "dataset/5_5_9_recovery"
+
+# Logging
+logging:
+  log_dir: "logs"
+
+# Module Parameters (hardcoded in swarm_lsm.py for clarity)
+# - Topographic Map: 3x3 grid
+# - CPG: 8-tick fatigue, 0.3 coupling
+# - Shadow Caster: 3 steps ahead
+# - Reservoir: 128 neurons per agent

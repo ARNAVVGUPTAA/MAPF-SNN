@@ -76,7 +76,7 @@ lsm:
   # distributed: All inputs broadcast to all meshes with random weights
   
   # Temporal Dynamics
-  num_ticks: 10  # Number of simulation timesteps per input (more = richer dynamics)
+  num_ticks: 15  # Number of simulation timesteps per input (LunarSNN used 12, more = richer dynamics for implicit divergence detection)
   
   # Weight Initialization
   weight_scale_E: 0.5  # Excitatory weight magnitude
@@ -91,7 +91,7 @@ readout:
   readout_from: "all_meshes"  # "all_meshes" or "last_mesh" or "selected_meshes"
   
   # For supervised learning from trajectory data
-  collect_episodes: 1000  # Number of expert episodes to collect liquid states from
+  collect_episodes: 500  # Number of expert episodes to collect liquid states from (start with 100, scale to 500+)
   validation_split: 0.1  # Reserve 10% for validation
 
 # Training Configuration
@@ -125,7 +125,7 @@ evaluation:
     - "E_I_balance"  # Excitatory/Inhibitory balance
     - "mesh_utilization"  # How many meshes are active
   
-  test_episodes: 100  # Number of episodes for evaluation
+  test_episodes: 300  # Number of episodes for evaluation
   visualize_reservoir: true  # Save visualization of reservoir activity
   save_metrics: true  # Save detailed metrics to file
 

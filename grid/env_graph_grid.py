@@ -3,7 +3,7 @@ import networkx as nx
 import matplotlib.pyplot as plt
 from scipy.linalg import sqrtm
 from scipy.special import softmax
-import gym
+import gymnasium as gym
 from gym import spaces
 from matplotlib import cm, colors
 

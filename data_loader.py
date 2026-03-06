@@ -15,27 +15,37 @@ class SNNDataset(Dataset):
     def __init__(self, cfg, mode):
         self.mode = mode
         self.cfg = cfg[mode]
-        root = self.cfg['root_dir']
-        self.data_dir = os.path.join(root, 'train' if mode == 'train' else 'valid')
-        
-        print(f"📂 Loading {mode} data from: {self.data_dir}")
-        
-        # Find all valid cases with required files
-        all_cases = [d for d in os.listdir(self.data_dir) if d.startswith('case_')]
-        print(f"   Found {len(all_cases)} case folders")
-        
-        # Load data dynamically without pre-allocating
+        split = 'train' if mode == 'train' else 'valid'
+
+        # Support single root_dir or list of root_dirs
+        roots = self.cfg.get('root_dirs', None)
+        if roots is None:
+            roots = [self.cfg['root_dir']]
+
+        # Collect (case_name, case_path) pairs from all roots
+        all_case_paths = []
+        for root in roots:
+            data_dir = os.path.join(root, split)
+            if not os.path.isdir(data_dir):
+                print(f"   ⚠️  Skipping missing dir: {data_dir}")
+                continue
+            print(f"📂 Loading {mode} data from: {data_dir}")
+            cases = sorted(d for d in os.listdir(data_dir) if d.startswith('case_'))
+            print(f"   Found {len(cases)} case folders")
+            all_case_paths.extend(
+                (case, os.path.join(data_dir, case), root)
+                for case in cases
+            )
+
         self.data = []
         loaded_count = 0
         skipped_count = 0
-        
-        for case in sorted(all_cases):
-            case_path = os.path.join(self.data_dir, case)
-            
+
+        for case, case_path, root in all_case_paths:
             # Check required files
-            states_file = os.path.join(case_path, 'states.npy')
+            states_file  = os.path.join(case_path, 'states.npy')
             actions_file = os.path.join(case_path, 'trajectory_record.npy')
-            gso_file = os.path.join(case_path, 'gso.npy')
+            gso_file     = os.path.join(case_path, 'gso.npy')
             
             if not all(os.path.exists(f) for f in [states_file, actions_file, gso_file]):
                 skipped_count += 1
@@ -78,6 +88,9 @@ class SNNDataset(Dataset):
                     'actions': actions.astype(np.float32),
                     'gso': gso.astype(np.float32),
                     'case': case,
+                    'case_dir': case_path,
+                    'source_root': root,
+                    'is_recovery': 'recovery' in root,
                     'timesteps': T
                 })
                 
@@ -93,9 +106,13 @@ class SNNDataset(Dataset):
                 continue
         
         print(f"   ✅ Loaded {loaded_count} cases, skipped {skipped_count}")
+
+        # Shuffle so multi-dir training mixes datasets from the start
+        import random
+        random.shuffle(self.data)
         
         if loaded_count == 0:
-            raise RuntimeError(f'No valid data loaded for {mode}! Check dataset at {self.data_dir}')
+            raise RuntimeError(f'No valid data loaded for {mode}! Check dataset roots: {roots}')
         
         self.num_samples = loaded_count
     

@@ -1,4 +1,8 @@
+import sys
 import os
+import gc
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+
 import yaml
 import torch
 import argparse
@@ -205,6 +209,7 @@ def create_solutions(path, num_cases, config, max_attempts=5, timeout=30):
             print(
                 f"Case {i}: Failed to generate a solvable instance after {max_attempts} attempts, skipping."
             )
+        gc.collect()  # free CBS search tree after every case
     print(f"Cases stored in {path}")
 
 
