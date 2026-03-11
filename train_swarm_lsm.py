@@ -38,6 +38,14 @@ def load_config(config_path):
         'sgd_epochs': config['training'].get('sgd_epochs', 50),
         'sgd_lr': config['training'].get('sgd_lr', 1e-3),
         'sgd_batch_size': config['training'].get('sgd_batch_size', 64),
+        'volatility_episodes': config['training'].get('volatility_episodes', 500),
+        'volatility_lr': config['training'].get('volatility_lr', 0.005),
+        'volatility_decay': config['training'].get('volatility_decay', 0.995),
+        'hybrid_cortex_method': config['training'].get('hybrid_cortex_method', 'sgd'),
+        'hybrid_volatility_episodes': config['training'].get('hybrid_volatility_episodes', 300),
+        'hybrid_volatility_lr': config['training'].get('hybrid_volatility_lr', 0.005),
+        'hybrid_phase1_checkpoint': config['training'].get('hybrid_phase1_checkpoint', None),
+        'skip_phase2': config['training'].get('skip_phase2', False),
         'log_dir': config['logging']['log_dir'],
         'full_config': config,  # Pass full config for SNNDataset
     }
@@ -82,17 +90,45 @@ def main():
     # Create trainer
     trainer = SwarmTrainer(network, device=config['device'])
     
-    # Collect liquid states
-    X_train, Y_train = trainer.collect_states(train_dataset, max_episodes=config['max_episodes'], num_ticks=config['num_ticks'])
-    
     # Train readouts
-    if config['optimizer'] == 'sgd':
-        trainer.train_sgd(X_train, Y_train,
-                          epochs=config['sgd_epochs'],
-                          lr=config['sgd_lr'],
-                          batch_size=config['sgd_batch_size'])
+    if config['optimizer'] == 'hybrid':
+        # HYBRID BIOMIMETIC: Cortex (supervised) + Volatility (reservoir destabilization)
+        trainer.train_hybrid(
+            train_dataset,
+            cortex_method=config['hybrid_cortex_method'],
+            max_episodes=config['max_episodes'],
+            volatility_episodes=config['hybrid_volatility_episodes'],
+            volatility_lr=config['hybrid_volatility_lr'],
+            volatility_decay=config.get('volatility_decay', 0.995),
+            num_ticks=config['num_ticks'],
+            phase1_checkpoint=config.get('hybrid_phase1_checkpoint'),
+            skip_phase2=config.get('skip_phase2', False),
+            # Pass cortex params
+            ridge_alpha=config.get('ridge_alpha', 1.0),
+            sgd_epochs=config.get('sgd_epochs', 150),
+            sgd_lr=config.get('sgd_lr', 1e-4),
+            sgd_batch_size=config.get('sgd_batch_size', 128)
+        )
+    elif config['optimizer'] == 'volatility':
+        # Pure synaptic volatility: Reservoir destabilization from VETOs (no supervised states)
+        trainer.train_volatility(
+            train_dataset,
+            num_episodes=config['volatility_episodes'],
+            lr=config['volatility_lr'],
+            decay=config['volatility_decay'],
+            num_ticks=config['num_ticks']
+        )
     else:
-        trainer.train_ridge(X_train, Y_train, alpha=config['ridge_alpha'])
+        # Pure supervised learning: Collect liquid states from expert trajectories
+        X_train, Y_train = trainer.collect_states(train_dataset, max_episodes=config['max_episodes'], num_ticks=config['num_ticks'])
+        
+        if config['optimizer'] == 'sgd':
+            trainer.train_sgd(X_train, Y_train,
+                              epochs=config['sgd_epochs'],
+                              lr=config['sgd_lr'],
+                              batch_size=config['sgd_batch_size'])
+        else:
+            trainer.train_ridge(X_train, Y_train, alpha=config['ridge_alpha'])
     
     # Create save directory
     from datetime import datetime as _dt
@@ -100,14 +136,15 @@ def main():
     save_dir = os.path.join(config['log_dir'], f'swarm_{timestamp}')
     os.makedirs(save_dir, exist_ok=True)
     
-    # Evaluate (use --log-ticks flag to see per-tick details)
+    # Evaluate — weights are frozen after Phase 2, pure inference only
     metrics = trainer.evaluate(
-        valid_dataset, 
+        valid_dataset,
         num_episodes=config['test_episodes'],
         max_timesteps=50,
         num_ticks=config['num_ticks'],
-        log_ticks=args.log_ticks,
-        save_dir=save_dir
+        log_ticks=True,
+        verbose=args.log_ticks,
+        save_dir=save_dir,
     )
     
     # Save
@@ -164,6 +201,11 @@ def main():
         f.write("✓ Shadow Caster (392 LIF neurons)\n")
         f.write("✓ Observation mesh (256 LIF neurons)\n")
         f.write("✓ Readout mesh (128 LIF neurons → 102 E)\n")
+
+        if metrics.get('tick_log'):
+            f.write("\nEPISODE TICK LOGS\n")
+            f.write("-"*70 + "\n")
+            f.write(metrics['tick_log'])
     
     print(f"\n💾 Saved to {save_dir}")
     print("\n" + "="*70)

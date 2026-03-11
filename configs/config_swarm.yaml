@@ -1,7 +1,5 @@
-# Hardware-Native Swarm LSM Configuration
-# =========================================
-# Three modules: Topographic Map + CPG + Shadow Caster
-# Pure spike routing. No matrix math.
+# Hardware-Native Swarm LSM (Biomimetic Hybrid System)
+# Cortex (supervised) learns global strategy, Volatility (liquid state destabilization) fixes collision mistakes
 
 # Swarm
 swarm:
@@ -10,14 +8,28 @@ swarm:
 
 # Training
 training:
-  max_episodes: 1000  # Liquid state collection episodes
-  test_episodes: 100  # Validation episodes
-  ridge_alpha: 0.75  # Ridge regression regularization
-  num_ticks: 30  # Number of simulation ticks per forward pass
-  optimizer: sgd  # "ridge" or "sgd"
-  sgd_epochs: 500
+  max_episodes: 1000
+  test_episodes: 100
+  num_ticks: 30
+  optimizer: hybrid  # ridge | sgd | volatility | hybrid
+  
+  # Supervised (Cortex: global strategy from expert demos)
+  ridge_alpha: 0.75
+  sgd_epochs: 150
   sgd_lr: 0.0001
   sgd_batch_size: 128
+  
+  # Synaptic Volatility (attractor destabilization through zero-mean noise)
+  volatility_episodes: 500  # Exploration after pre-training
+  volatility_lr: 0.005  # Zero-mean noise magnitude for reservoir scrambling
+  volatility_decay: 0.998  # Slower decay for fine-tuning
+  
+  # Hybrid Mode: Cortex (supervised) + Volatility (reservoir destabilization)
+  hybrid_cortex_method: sgd  # "ridge" or "sgd" for Phase 1 pre-training
+  hybrid_volatility_episodes: 300  # Phase 2: synaptic volatility episodes
+  hybrid_volatility_lr: 0.005  # Noise magnitude (zero-mean, energy-preserving)
+  hybrid_phase1_checkpoint: "checkpoints/lsm/phase1_cortex.pt"  # Save/load Phase 1 weights; delete file to retrain
+  skip_phase2: true  # Set to true to evaluate on Phase 1 weights only (skips S.E.X. V2)
 
 # Dataset - format for SNNDataset
 train:
@@ -35,7 +47,9 @@ logging:
   log_dir: "logs"
 
 # Module Parameters (hardcoded in swarm_lsm.py for clarity)
-# - Topographic Map: 3x3 grid
-# - CPG: 8-tick fatigue, 0.3 coupling
-# - Shadow Caster: 3 steps ahead
-# - Reservoir: 128 neurons per agent
+# - Topographic Map: 3x3 grid (144 neurons)
+# - CPG: 8-tick fatigue, 0.3 coupling (32 neurons)
+# - Shadow Caster: 3 steps ahead (392 neurons)
+# - Observation Mesh: 256 LIF neurons
+# - Readout Mesh: 256 LIF neurons
+# - Total: ~1,090 LIF neurons per agent (still tiny for edge AI)

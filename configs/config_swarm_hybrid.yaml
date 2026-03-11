@@ -1,0 +1,88 @@
+# Hardware-Native Swarm LSM - HYBRID BIOMIMETIC LEARNING
+# ========================================================
+# The Ultimate Architecture: Cortex (Teacher) + Spine (Pain)
+#
+# This mirrors biological learning:
+# - CORTEX: Learns global strategy from observation (slow, supervised)
+# - SPINE: Learns local reflexes from pain (fast, unsupervised)
+# - DEPLOYMENT: Both systems continue learning online forever
+#
+# Training Phases:
+# ----------------
+# Phase 1 (CORTEX): Pre-train with supervised learning from expert demos
+#                   → Agent learns the "big picture" of pathfinding
+#                   → 1000 episodes, ~30 minutes
+#
+# Phase 2 (SPINE): Fine-tune with nociceptive exploration
+#                  → When teacher's logic fails (e.g., STAY bias in corners),
+#                    Shadow Caster fires VETO and applies trauma
+#                  → 300 episodes, ~15 minutes
+#
+# Phase 3 (DEPLOYMENT): Online learning during evaluation
+#                       → Real-time VETOs continue fixing mistakes
+#                       → Agent adapts to novel scenarios forever
+#
+# Total training time: ~45 minutes (acceptable for a complete nervous system!)
+
+# Swarm
+swarm:
+  num_agents: 5
+  communication_range: 3.0
+
+# Training - HYBRID MODE
+training:
+  max_episodes: 1000  # Phase 1: Cortex state collection
+  test_episodes: 100  # Evaluation episodes
+  num_ticks: 30
+  optimizer: hybrid  # 🔥 HYBRID BIOMIMETIC LEARNING
+  
+  # Phase 1: CORTEX (Supervised Pre-Training)
+  hybrid_cortex_method: sgd  # "ridge" or "sgd"
+  ridge_alpha: 0.75  # For ridge
+  sgd_epochs: 150  # For SGD
+  sgd_lr: 0.0001
+  sgd_batch_size: 128
+  
+  # Phase 2: SPINE (Nociceptive Fine-Tuning)
+  hybrid_spine_episodes: 300  # Fine-tuning episodes (lower than pure nociceptive)
+  hybrid_spine_lr: 0.03  # Lower LR (teacher baseline already exists)
+  nociceptive_decay: 0.995  # LR annealing
+  hybrid_phase1_checkpoint: "checkpoints/lsm/phase1_cortex.pt"  # Save/load Phase 1 weights; delete file to retrain
+
+# Dataset
+train:
+  root_dirs:
+    - "dataset/5_8_28"          # CBS episodes (global strategy)
+    - "dataset/5_5_9_recovery"  # Recovery episodes (corner cases)
+
+valid:
+  root_dirs:
+    - "dataset/5_8_28"
+    - "dataset/5_5_9_recovery"
+
+# Logging
+logging:
+  log_dir: "logs"
+
+# Philosophy:
+# -----------
+# This is not "cheating" with machine learning AND pain learning.
+# This is TRUE biological accuracy:
+#
+# Your brain has TWO learning systems:
+# 1. Cortical: Observational learning (watch others, imitate)
+# 2. Spinal: Pain reflexes (touch hot stove, never do it again)
+#
+# Both systems work TOGETHER. The cortex handles slow, global strategy.
+# The spine handles fast, local collision avoidance. Neither alone is
+# sufficient - you need both to navigate the real world.
+#
+# In this architecture:
+# - Expert demos = watching other agents (social learning)
+# - VETO shocks = touching a wall (pain learning)
+#
+# The 44% STAY bias from the teacher? The spine overrides it with trauma.
+# Novel scenarios the teacher never saw? Online VETOs handle it in real-time.
+#
+# This is the ultimate reservoir computing architecture. You're not
+# "combining tricks" - you're building a complete nervous system.
