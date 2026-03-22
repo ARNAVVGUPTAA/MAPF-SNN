@@ -400,30 +400,13 @@ class GhostAntenna(nn.Module):
         self,
         fov_walls: torch.Tensor,
         fov_goal: torch.Tensor,
+        fov_pheromones: torch.Tensor,
         num_ticks: int = 10,
-        gain: float = 1.5,  # Lowered gain for healthy LIF integration
+        gain: float = 1.5,
+        invert_scent: bool = False,
     ) -> torch.Tensor:
-        """
-        Args:
-            fov_walls: [7, 7] wall channel from observation (agent at centre [3, 3])
-            fov_goal:  [7, 7] goal channel from observation (non-zero where goal visible)
-            num_ticks: LIF simulation ticks
-            gain: scent current multiplier (best direction → 1.5V → ~20 spikes/30 ticks)
+        fov_targets = [(3, 4), (2, 3), (3, 2), (4, 3), (3, 3)]
 
-        Returns:
-            spikes: [5] spike counts per action (RIGHT/UP/LEFT/DOWN/STAY)
-
-        No global coordinates used — the agent reads only its local FOV.
-        """
-        fov_targets = [
-            (3, 4),  # RIGHT
-            (2, 3),  # UP
-            (3, 2),  # LEFT
-            (4, 3),  # DOWN
-            (3, 3),  # STAY
-        ]
-
-        # Locate goal within the FOV grid — purely local, no GPS math
         goal_mask   = fov_goal > 0
         goal_in_fov = bool(goal_mask.any().item())
         if goal_in_fov:
@@ -434,21 +417,31 @@ class GhostAntenna(nn.Module):
         scent = torch.zeros(5, device=fov_walls.device)
         for action_id, (fov_y, fov_x) in enumerate(fov_targets):
             if fov_walls[fov_y, fov_x] > 0.5:
-                scent[action_id] = 0.0          # wall blocks this direction
+                scent[action_id] = -999.0
             elif goal_in_fov:
-                # Square the distance for sharper drop-off: only immediate neighbours score high
                 d = abs(fov_y - goal_row) + abs(fov_x - goal_col)
-                scent[action_id] = 10.0 / (d ** 2 + 1.0)
+                base_scent = 10.0 / (d ** 2 + 1.0)
+                toxicity = fov_pheromones[fov_y, fov_x].item()
+                scent[action_id] = base_scent - (toxicity * 3.0)
             else:
-                scent[action_id] = 1.0          # goal outside FOV: uniform weak scent
+                toxicity = fov_pheromones[fov_y, fov_x].item()
+                scent[action_id] = 1.0 - (toxicity * 3.0)
 
-        # Normalise so best direction = 1.0, worst ≈ 0.0 (contrast fix)
+        # Biological aversion: while frustrated, the goal beacon flips from
+        # attractant to repellent, so the furthest valid action becomes best.
+        if invert_scent and goal_in_fov:
+            valid_mask = scent > -100.0
+            if valid_mask.any():
+                max_s = scent[valid_mask].max()
+                scent[valid_mask] = max_s - scent[valid_mask] + 0.1
+
+        # Never retreat into a wall.
+        scent[scent < 0] = 0.0
+
         scent_max = scent.max()
         if scent_max > 0.001:
             scent = scent / scent_max
 
-        # best direction current = gain (1.5V → ~20 spikes in 30 ticks)
-        # bad direction current  = ~0.0V → 0 spikes
         current = scent * gain
 
         functional.reset_net(self.lif)
@@ -473,9 +466,18 @@ class AgentLSM(nn.Module):
     
     Only E neurons project between modules (Dale's Law).
     """
-    def __init__(self, agent_id: int):
+    def __init__(
+        self,
+        agent_id: int,
+        enable_cpg: bool = True,
+        enable_shadow: bool = True,
+        enable_ghost: bool = True,
+    ):
         super().__init__()
         self.agent_id = agent_id
+        self.enable_cpg = enable_cpg
+        self.enable_shadow = enable_shadow
+        self.enable_ghost = enable_ghost
         
         # === OBSERVATION PROCESSING MESH ===
         # LIF mesh for encoding FOV (replaces Tanh reservoir)
@@ -598,10 +600,14 @@ class AgentLSM(nn.Module):
         )
         
         # === STEP 4: CPG ===
-        my_cpg_E, should_stay = self.cpg(
-            neighbor_E_spikes=torch.stack(neighbor_cpg_E) if len(neighbor_cpg_E) > 0 else None,
-            num_ticks=5
-        )
+        if self.enable_cpg:
+            my_cpg_E, should_stay = self.cpg(
+                neighbor_E_spikes=torch.stack(neighbor_cpg_E) if len(neighbor_cpg_E) > 0 else None,
+                num_ticks=5
+            )
+        else:
+            my_cpg_E = torch.zeros(self.cpg.num_E, device=action_logits.device)
+            should_stay = False
         
         # CPG modulation: gentle nudge to turn-take
         if should_stay:
@@ -624,7 +630,9 @@ class AgentLSM(nn.Module):
         velocity = action_to_velocity[tentative_action]
 
         walls = observation[0]
-        veto = self.shadow(walls, velocity, num_ticks=1)  # Only fear the immediate next cell
+        veto = False
+        if self.enable_shadow:
+            veto = self.shadow(walls, velocity, num_ticks=1)  # Only fear the immediate next cell
 
         # Shadow VETO: hard wall reflex
         if veto:
@@ -652,20 +660,38 @@ class SwarmLSM(nn.Module):
     Communication = E neuron spike broadcasts only (Dale's Law).
     Pheromone Mesh = Shared environmental memory (repels from visited cells).
     """
-    def __init__(self, num_agents: int = 5, communication_range: float = 3.0):
+    def __init__(
+        self,
+        num_agents: int = 5,
+        communication_range: float = 3.0,
+        enable_cpg: bool = True,
+        enable_shadow: bool = True,
+        enable_ghost: bool = True,
+        enable_veto_bridge: bool = True,
+    ):
         super().__init__()
         self.num_agents = num_agents
         self.communication_range = communication_range
+        self.enable_cpg = enable_cpg
+        self.enable_shadow = enable_shadow
+        self.enable_ghost = enable_ghost
+        self.enable_veto_bridge = enable_veto_bridge
         
         # Create independent spiking agents
         self.agents = nn.ModuleList([
-            AgentLSM(agent_id=i) for i in range(num_agents)
+            AgentLSM(
+                agent_id=i,
+                enable_cpg=enable_cpg,
+                enable_shadow=enable_shadow,
+                enable_ghost=enable_ghost,
+            ) for i in range(num_agents)
         ])
         
         # S.E.X. V2: Noradrenaline injection state
         # When a VETO is detected, store {agent_id: noise_magnitude} here
         # Forward pass will check this and inject voltage noise
         self.inject_noradrenaline = {}
+        self.noradrenaline_panic_ticks = 5
     
     def reset(self):
         """Reset all agents' spiking dynamics"""
@@ -697,6 +723,7 @@ class SwarmLSM(nn.Module):
         positions: torch.Tensor,
         num_ticks: int = 10,
         goals: torch.Tensor = None,
+        pheromones: torch.Tensor = None,
     ) -> Tuple[torch.Tensor, List[torch.Tensor], List[torch.Tensor]]:
         """
         Swarm spiking forward pass.
@@ -706,12 +733,27 @@ class SwarmLSM(nn.Module):
             positions: [N, 2] agent positions
             num_ticks: Simulation ticks
             goals: [N, 2] goal positions — drives chemotaxis receptors (optional)
+            pheromones: [N, 7, 7] per-agent pheromone FOVs (optional)
         
         Returns:
             action_spikes: [N, 5] action spike counts
             intent_E_spikes: List of [num_E] intent map E spikes
             cpg_E_spikes: List of [num_E] CPG E spikes
         """
+        # --- Chemical capacitor: frustration timers ---
+        # Each agent has a countdown (in forward-pass steps). While > 0 the agent
+        # treats the goal beacon as aversive and retreats out of its current trap.
+        # The timer is charged by a hard VETO (see multiplexer below) and counts
+        # down by 1 each forward pass automatically.
+        if not hasattr(self, 'frustration_timers') or len(self.frustration_timers) != self.num_agents:
+            self.frustration_timers = {i: 0 for i in range(self.num_agents)}
+
+        active_frustration = set()
+        for i in range(self.num_agents):
+            if self.frustration_timers[i] > 0:
+                active_frustration.add(i)
+                self.frustration_timers[i] -= 1
+
         # Single pass: run obs+readout mesh once per agent, cache results
         cached_readout_E   = []
         cached_action_acc  = []
@@ -724,15 +766,30 @@ class SwarmLSM(nn.Module):
         for agent_id in range(self.num_agents):
             ag  = self.agents[agent_id]
             obs = observations[agent_id]
+            panic_active = agent_id in active_frustration
+            phero = (
+                pheromones[agent_id]
+                if pheromones is not None
+                else torch.zeros((7, 7), dtype=obs.dtype, device=obs.device)
+            )
 
             # --- obs mesh ---
             obs_flat = obs.flatten()
-            obs_input = ag.obs_input_proj(obs_flat) * 1.5
+            # During panic, suppress goal channel (channel 1) to force short
+            # escape behavior before intent resumes.
+            obs_no_goal = obs.clone()
+            obs_no_goal[1] = 0.0
+            obs_no_goal_flat = obs_no_goal.flatten()
+
+            obs_input_goal = ag.obs_input_proj(obs_flat) * 1.5
+            obs_input_nogoal = ag.obs_input_proj(obs_no_goal_flat) * 1.5
             obs_acc = torch.zeros(ag.obs_mesh.num_neurons, device=obs_flat.device)
             obs_cur = torch.zeros(ag.obs_mesh.num_neurons, device=obs_flat.device)
-            for _ in range(num_ticks):
+            for tick in range(num_ticks):
                 rec = ag.obs_recurrent(obs_cur) * ag.obs_mesh.ei_mask
-                obs_cur  = ag.obs_mesh.lif(obs_input * 0.8 + rec * 0.2)
+                beta = 1.0 if panic_active else 0.0
+                obs_drive = obs_input_goal * (1.0 - beta) + obs_input_nogoal * beta
+                obs_cur  = ag.obs_mesh.lif(obs_drive * 0.8 + rec * 0.2)
                 obs_acc += obs_cur
 
             obs_E      = ag.obs_mesh.get_E_neurons(obs_acc)
@@ -740,19 +797,12 @@ class SwarmLSM(nn.Module):
             rd_acc     = torch.zeros(ag.readout_mesh.num_neurons, device=obs_flat.device)
             rd_cur     = torch.zeros(ag.readout_mesh.num_neurons, device=obs_flat.device)
             
-            # S.E.X. V2: Noradrenaline Flush (voltage injection for online learning)
+            # During retreat mode we no longer inject random noise here.
+            # The escape behavior comes from the aversive GhostAntenna instead.
             for tick in range(num_ticks):
                 rec = ag.readout_recurrent(rd_cur) * ag.readout_mesh.ei_mask
                 total_input = rd_input * 0.85 + rec * 0.15
-                
-                # NORADRENALINE FLUSH: If this agent had a VETO, inject chemical noise
-                if agent_id in self.inject_noradrenaline and tick == 0:  # Only first tick
-                    noise_magnitude = self.inject_noradrenaline[agent_id]
-                    num_E = ag.readout_mesh.num_E
-                    chemical_noise = torch.zeros(ag.readout_mesh.num_neurons, device=obs_flat.device)
-                    chemical_noise[:num_E] = torch.abs(torch.randn(num_E, device=obs_flat.device)) * noise_magnitude * 3.0
-                    total_input = total_input + chemical_noise
-                
+
                 rd_cur  = ag.readout_mesh.lif(total_input)
                 rd_acc += rd_cur
 
@@ -761,21 +811,31 @@ class SwarmLSM(nn.Module):
             # --- action selection: logits directly (no LIF bottleneck) ---
             action_logits = ag.action_weights(readout_E)
             
-            # GhostAntenna: FOV-local 1-step lookahead — no global coordinates
-            antenna_spikes = ag.ghost_antenna(
-                obs[0], obs[1],  # fov_walls, fov_goal
-                num_ticks=num_ticks, gain=1.5
-            )
-            action_logits = action_logits + antenna_spikes * 0.4
+            # GhostAntenna: FOV-local 1-step lookahead.
+            # While frustrated, the goal scent is inverted so the agent retreats.
+            if self.enable_ghost:
+                antenna_spikes = ag.ghost_antenna(
+                    obs[0], obs[1], phero,
+                    num_ticks=num_ticks,
+                    gain=2.5 if panic_active else 1.5,
+                    invert_scent=panic_active,
+                )
+                action_logits = action_logits + antenna_spikes * (1.5 if panic_active else 0.4)
 
             tentative = int(torch.argmax(action_logits).item())
 
             # --- Pass 1: intent map + CPG with no neighbors (cold broadcast) ---
             intent_E_cold, _ = ag.intent_map(action=tentative, neighbor_E_spikes=None, num_ticks=5)
-            cpg_E_cold, should_stay_cold = ag.cpg(neighbor_E_spikes=None, num_ticks=5)
+            if self.enable_cpg:
+                cpg_E_cold, should_stay_cold = ag.cpg(neighbor_E_spikes=None, num_ticks=5)
+            else:
+                cpg_E_cold = torch.zeros(ag.cpg.num_E, device=obs.device)
+                should_stay_cold = False
             # --- shadow ---
             vel_map = {0:(1,0),1:(0,-1),2:(-1,0),3:(0,1),4:(0,0)}
-            veto = ag.shadow(obs[0], vel_map[tentative], num_ticks=1)
+            veto = False
+            if self.enable_shadow:
+                veto = ag.shadow(obs[0], vel_map[tentative], num_ticks=1)
 
             cached_readout_E.append(readout_E)
             cached_action_acc.append(action_logits)
@@ -806,7 +866,8 @@ class SwarmLSM(nn.Module):
 
                 # Reset LIF state so the second run is clean
                 functional.reset_net(ag.intent_map.lif)
-                functional.reset_net(ag.cpg.lif)
+                if self.enable_cpg:
+                    functional.reset_net(ag.cpg.lif)
 
                 tentative = int(torch.argmax(cached_action_acc[agent_id]).item())
                 intent_E, intent_veto = ag.intent_map(
@@ -815,26 +876,84 @@ class SwarmLSM(nn.Module):
                     num_ticks=5
                 )
 
-                cpg_E, should_stay = ag.cpg(
-                    neighbor_E_spikes=nb_cpg,
-                    num_ticks=5
-                )
+                if self.enable_cpg:
+                    cpg_E, should_stay = ag.cpg(
+                        neighbor_E_spikes=nb_cpg,
+                        num_ticks=5
+                    )
+                else:
+                    cpg_E = torch.zeros(ag.cpg.num_E, device=positions.device)
+                    should_stay = False
 
                 cached_intent_E[agent_id]    = intent_E
                 cached_intent_veto[agent_id] = intent_veto
                 cached_cpg_E[agent_id]       = cpg_E
                 cached_should_stay[agent_id] = should_stay
 
-        # Apply CPG/shadow modulation using fully-wired cached results
-        # (obs/readout reservoir untouched — only intent_map/CPG re-ran above)
+        # ==========================================================
+        # ABSOLUTE SUBSUMPTION BRIDGE (Impenetrable Hardware Reflex)
+        # Three-pass collision oracle that runs BEFORE the multiplexer so that
+        # every kind of illegal move is caught and VETO'd in one place.
+        # ==========================================================
+        if self.enable_veto_bridge and positions is not None and self.num_agents > 0:
+            _swap_delta = {0: (1, 0), 1: (0, -1), 2: (-1, 0), 3: (0, 1), 4: (0, 0)}
+            # Re-read intended actions from the (possibly noradrenaline-modified)
+            # logit cache so we test what the agent is actually about to do.
+            _tentative = [
+                int(torch.argmax(cached_action_acc[i]).item())
+                for i in range(self.num_agents)
+            ]
+            _dest_map = {}
+            _curr_pos = {}
+            center = observations.shape[-1] // 2  # FOV center index (3 for 7x7)
+
+            # Map every agent's current integer position once.
+            for _i in range(self.num_agents):
+                _curr_pos[_i] = (int(positions[_i, 0].item()), int(positions[_i, 1].item()))
+
+            for _i in range(self.num_agents):
+                act = _tentative[_i]
+                dx, dy = _swap_delta[act]
+
+                # 1. HARD WALL CHECK — look directly at the 1-step lookahead cell
+                #    inside the agent's own FOV (channel 0 = walls/obstacles).
+                #    observations[_i] is [2, H, W]; row = y-offset, col = x-offset.
+                if act != 4:
+                    if observations[_i, 0, center + dy, center + dx].item() > 0.5:
+                        cached_veto[_i] = True
+
+                # 2. VERTEX / PARKED-AGENT CHECK
+                #    Map every agent's destination (STAY agents map to their own cell).
+                #    First occupant wins; any later arrival is VETO'd along with it.
+                _dest = (_curr_pos[_i][0] + dx, _curr_pos[_i][1] + dy)
+                if _dest in _dest_map:
+                    _j = _dest_map[_dest]
+                    cached_veto[_i] = True
+                    cached_veto[_j] = True
+                else:
+                    _dest_map[_dest] = _i
+
+                # 3. EDGE SWAP CHECK — head-on collision with any already-processed agent.
+                for _j in range(_i):
+                    act_j = _tentative[_j]
+                    dx_j, dy_j = _swap_delta[act_j]
+                    dest_j = (_curr_pos[_j][0] + dx_j, _curr_pos[_j][1] + dy_j)
+                    if _dest == _curr_pos[_j] and dest_j == _curr_pos[_i]:
+                        cached_veto[_i] = True
+                        cached_veto[_j] = True
+        # ==========================================================
+
+        # HARDWARE MULTIPLEXER — Absolute Subsumption
+        # Priority hierarchy (highest wins):
+        #   1. veto / intent_veto  → hard clamp: movement pins → -999, STAY pin → +999
+        #      This is a physical switch, not a logit nudge.  Regardless of how much
+        #      noradrenaline noise was injected, argmax CANNOT return anything but 4.
+        #   2. should_stay (CPG)   → gentle nudge: STAY = max + 1 (suggestion, not law)
         #
-        # ARCHITECTURAL DEBT — SOFTWARE SUBSUMPTION BRIDGE:
-        # The VETO/CPG signals below are injected via direct tensor writes rather
-        # than through a real inhibitory spike projection onto the motor neurons.
-        # In true neuromorphic hardware the ShadowCaster would fire an inhibitory
-        # volley suppressing RIGHT/UP/LEFT/DOWN and exciting STAY. Here a Python
-        # if-statement plays that role. This is a known lie; fixing it requires a
-        # dedicated InhibitoryProjection layer routing shadow spikes → motor layer.
+        # The old three-independent-if approach had a subtle stomp bug: each branch
+        # re-evaluated action_acc.max() on a tensor whose index-4 may have already
+        # been overwritten by a previous branch, making the effective margin smaller
+        # than intended.  The elif chain below eliminates that entirely.
         final_action_spikes = []
         for agent_id in range(self.num_agents):
             action_acc  = cached_action_acc[agent_id].clone()
@@ -842,12 +961,18 @@ class SwarmLSM(nn.Module):
             veto        = cached_veto[agent_id]
             intent_veto = cached_intent_veto[agent_id]
 
-            if should_stay:
-                action_acc[4] = action_acc.max() + 1.0   # gentle CPG nudge
-            if intent_veto:  # spatial forcefield: neighbour claimed this cell — yield!
-                action_acc[4] = action_acc.max() + 5.0
-            if veto:
-                action_acc[4] = action_acc.max() + 10.0  # hard wall reflex
+            if self.enable_veto_bridge and (veto or intent_veto):
+                # Hard clamp — physically impossible for argmax to return a movement index
+                action_acc[0] = -999.0  # Kill RIGHT
+                action_acc[1] = -999.0  # Kill UP
+                action_acc[2] = -999.0  # Kill LEFT
+                action_acc[3] = -999.0  # Kill DOWN
+                action_acc[4] =  999.0  # Force STAY
+                # Charge the chemical capacitor: trigger a 6-step retreat
+                if self.frustration_timers[agent_id] == 0:
+                    self.frustration_timers[agent_id] = 6
+            elif should_stay:
+                action_acc[4] = action_acc.max() + 1.0  # gentle CPG nudge
 
             final_action_spikes.append(action_acc)
 
@@ -1335,7 +1460,17 @@ class SwarmTrainer:
                         if grid[ny, nx] > 1.5:
                             new_pos[i] = [int(positions_temp[i, 0].item()), int(positions_temp[i, 1].item())]
 
-                    # Agent-agent collision: revert both agents
+                    # EDGE (SWAP) COLLISION: two agents crossing the same edge in opposite
+                    # directions — neither ends up at the same cell so position_dict misses it.
+                    for i in range(self.network.num_agents):
+                        for j in range(i + 1, self.network.num_agents):
+                            i_to_j = (new_pos[i] == [int(positions_temp[j, 0].item()), int(positions_temp[j, 1].item())])
+                            j_to_i = (new_pos[j] == [int(positions_temp[i, 0].item()), int(positions_temp[i, 1].item())])
+                            if i_to_j and j_to_i:
+                                new_pos[i] = [int(positions_temp[i, 0].item()), int(positions_temp[i, 1].item())]
+                                new_pos[j] = [int(positions_temp[j, 0].item()), int(positions_temp[j, 1].item())]
+
+                    # Agent-agent (vertex) collision: revert both agents
                     position_dict = {}
                     for i in range(self.network.num_agents):
                         pos_key = tuple(new_pos[i])
@@ -1588,7 +1723,23 @@ class SwarmTrainer:
                     if grid[iy, ix] > 1.5:
                         new_positions[i] = positions_temp[i]
 
-                # Agent-agent collision: revert both agents
+                # EDGE (SWAP) COLLISION: two agents crossing the same edge in opposite
+                # directions — neither ends up at the same cell so position_dict misses it.
+                for i in range(self.network.num_agents):
+                    for j in range(i + 1, self.network.num_agents):
+                        i_to_j = (
+                            int(new_positions[i, 0].item()) == int(positions_temp[j, 0].item()) and
+                            int(new_positions[i, 1].item()) == int(positions_temp[j, 1].item())
+                        )
+                        j_to_i = (
+                            int(new_positions[j, 0].item()) == int(positions_temp[i, 0].item()) and
+                            int(new_positions[j, 1].item()) == int(positions_temp[i, 1].item())
+                        )
+                        if i_to_j and j_to_i:
+                            new_positions[i] = positions_temp[i]
+                            new_positions[j] = positions_temp[j]
+
+                # Agent-agent (vertex) collision: revert both agents
                 position_dict = {}
                 for i in range(self.network.num_agents):
                     pos_key = (int(new_positions[i, 0].item()), int(new_positions[i, 1].item()))
@@ -1885,8 +2036,26 @@ class SwarmTrainer:
                         if grid[y, x] > 1.5:  # Hit wall (value == 2)
                             new_positions[i] = positions_temp[i]  # Revert
                             ep_wall_bounces[i] += 1
-                    
-                    # AGENT-AGENT COLLISION: Check if multiple agents at same position
+
+                    # EDGE (SWAP) COLLISION: two agents crossing the same edge in opposite
+                    # directions — neither ends up at the same cell so position_dict misses it.
+                    for i in range(num_agents):
+                        for j in range(i + 1, num_agents):
+                            i_to_j = (
+                                int(new_positions[i, 0].item()) == int(positions_temp[j, 0].item()) and
+                                int(new_positions[i, 1].item()) == int(positions_temp[j, 1].item())
+                            )
+                            j_to_i = (
+                                int(new_positions[j, 0].item()) == int(positions_temp[i, 0].item()) and
+                                int(new_positions[j, 1].item()) == int(positions_temp[i, 1].item())
+                            )
+                            if i_to_j and j_to_i:
+                                new_positions[i] = positions_temp[i]
+                                new_positions[j] = positions_temp[j]
+                                collisions_this_ep += 1
+                                ep_agent_collisions += 1
+
+                    # AGENT-AGENT (VERTEX) COLLISION: Check if multiple agents at same position
                     position_dict = {}
                     for i in range(num_agents):
                         pos_key = (int(new_positions[i, 0].item()), int(new_positions[i, 1].item()))
@@ -2024,16 +2193,14 @@ class SwarmTrainer:
                                       mutual spike inhibition drives them into anti-phase
                                       (emergent decentralised turn-taking).
 
-          3. minds_eye.png          – Three-panel spatial view:
-                                        Panel 1 – raw 7×7 FOV
-                                        Panel 2 – Topographic Intent Broadcast heatmap
-                                        Panel 3 – Shadow Raycast path to wall
+          3. lsm_raster.png         – Readout-mesh spike raster over the same
+                                      subsumption trace window, showing sparse,
+                                      structured liquid activity.
         """
         try:
             import matplotlib
             matplotlib.use('Agg')
             import matplotlib.pyplot as plt
-            import matplotlib.patches as mpatches
         except ImportError:
             print("   matplotlib not installed – skipping diagnostics")
             return
@@ -2084,6 +2251,7 @@ class SwarmTrainer:
             rd_inp = ag0.readout_input(ag0.obs_to_readout(obs_E)) * 0.9
 
         motor_voltage = np.zeros((TRACE_TICKS, 5))
+        spike_raster = np.zeros((ag0.readout_mesh.num_E, TRACE_TICKS))
         rd_acc  = torch.zeros(ag0.readout_mesh.num_neurons, device=self.device)
         rd_cur  = torch.zeros(ag0.readout_mesh.num_neurons, device=self.device)
 
@@ -2097,12 +2265,16 @@ class SwarmTrainer:
                 rd_cur = ag0.readout_mesh.lif(rd_inp * 0.85 + rec * 0.15)
                 rd_acc += rd_cur
 
+                current_E_spikes = ag0.readout_mesh.get_E_neurons(rd_cur).cpu().numpy()
+                spike_raster[:, t] = current_E_spikes
+
                 # 3. Base motor cortex (outputs real non-zero logits)
                 action_logits = ag0.action_weights(ag0.readout_mesh.get_E_neurons(rd_acc))
 
                 # 4. Ghost Antenna
+                diag_phero = torch.zeros((7, 7), dtype=corridor_obs.dtype, device=self.device)
                 antenna_spikes = ag0.ghost_antenna(
-                    corridor_obs[0], corridor_obs[1], num_ticks=1, gain=1.5
+                    corridor_obs[0], corridor_obs[1], diag_phero, num_ticks=1, gain=1.5
                 )
                 action_logits = action_logits + antenna_spikes * 0.4
 
@@ -2236,130 +2408,23 @@ class SwarmTrainer:
         print(f"      ✅  cpg_antiphase.png")
 
         # ══════════════════════════════════════════════════════════════════════
-        # PLOT 3 – MIND'S EYE  (three-panel spatial view)
+        # PLOT 3 – LSM SPIKE RASTER
         # ══════════════════════════════════════════════════════════════════════
-        FOV = 7
-
-        # ── Panel 2: Pre-Motor Action Landscape ─────────────────────────────
-        # Grab the final-tick motor voltage (neuromodulated by Ghost Antenna +0.05/tick
-        # in the trace loop above; Shadow VETO adds +1.0 to STAY at veto_tick)
-        # and apply softmax to visualise action probabilities.
-        raw_logits   = motor_voltage[-1].astype(np.float64)      # [RIGHT,UP,LEFT,DOWN,STAY]
-        exp_logits   = np.exp(raw_logits - np.max(raw_logits))
-        action_probs = exp_logits / exp_logits.sum()
-
-        pre_motor_grid = np.zeros((3, 3))
-        pre_motor_grid[1, 2] = action_probs[0]   # RIGHT
-        pre_motor_grid[0, 1] = action_probs[1]   # UP
-        pre_motor_grid[1, 0] = action_probs[2]   # LEFT
-        pre_motor_grid[2, 1] = action_probs[3]   # DOWN
-        pre_motor_grid[1, 1] = action_probs[4]   # STAY
-
-        # ── Panel 3: Shadow Raycast ───────────────────────────────────────────
-        walls_ch   = corridor_obs[0].cpu().numpy()   # [7, 7]
-        shadow_map = np.zeros((FOV, FOV))
-        cr, cc     = FOV // 2, FOV // 2              # agent centre
-        shadow_map[cr, cc] = 0.3                      # agent marker
-        # FIX: Strip the subsumption bridge injection to see what the raw brain wanted!
-        pre_veto_logits = motor_voltage[-1].copy()
-        if veto_tick is not None:
-            pre_veto_logits[4] -= 1.0  # undo the +1.0 STAY injection the bridge added
-        chosen_action_shadow = int(np.argmax(pre_veto_logits))
-        action_to_velocity   = {0:(1,0), 1:(0,-1), 2:(-1,0), 3:(0,1), 4:(0,0)}
-        dx_v, dy_v = action_to_velocity[chosen_action_shadow]
-        r_ray, c_ray = cr, cc
-        veto_r, veto_c = None, None
-        for step in range(1, FOV):
-            c_ray += dx_v
-            r_ray += dy_v
-            if not (0 <= r_ray < FOV and 0 <= c_ray < FOV):
-                break
-            if walls_ch[r_ray, c_ray] > 1.5:
-                shadow_map[r_ray, c_ray] = 1.0       # wall hit — full red
-                veto_r, veto_c = r_ray, c_ray
-                break
-            shadow_map[r_ray, c_ray] = max(0.1, 1.0 - step * 0.18)
-
-        # ── Render three panels ───────────────────────────────────────────────
-        fig, axes = plt.subplots(1, 3, figsize=(15, 5))
-
-        # Panel 1: FOV
-        ax = axes[0]
-        fov_rgb = np.ones((FOV, FOV, 3)) * 0.96          # free = near-white
-        w_mask  = walls_ch > 1.5
-        fov_rgb[w_mask] = [0.25, 0.25, 0.25]             # walls = dark grey
-        fov_rgb[cr, cc] = [0.13, 0.59, 0.95]             # agent = blue
-        g_mask = corridor_obs[1].cpu().numpy() > 0
-        fov_rgb[g_mask] = [1.0, 0.84, 0.0]               # goal = gold
-        ax.imshow(fov_rgb, origin='upper', interpolation='nearest')
-        ax.set_title('Panel 1: Agent FOV\n(grey=wall  blue=agent  gold=goal)',
-                     fontsize=10, fontweight='bold')
-        ax.set_xticks(range(FOV)); ax.set_yticks(range(FOV))
-        ax.grid(True, lw=0.6, color='k', alpha=0.25)
-        ax.set_xlabel('x'); ax.set_ylabel('y')
-
-        # Panel 2: Pre-Motor Action Landscape
-        ax = axes[1]
-        im2 = ax.imshow(pre_motor_grid, cmap='magma', origin='upper',
-                        vmin=0, vmax=1.0, interpolation='nearest')
-        ax.set_title('Panel 2: Pre-Motor Action Landscape\n'
-                     '(SNN simultaneously weighing all paths before argmax)',
-                     fontsize=10, fontweight='bold')
-        ax.set_xticks([0, 1, 2]); ax.set_yticks([0, 1, 2])
-        ax.set_xticklabels(['LEFT', 'CTR', 'RIGHT'], fontsize=9)
-        ax.set_yticklabels(['UP', 'CTR', 'DOWN'],    fontsize=9)
-        # Percentage annotations on every active cell
-        ACTION_LABEL_POS = [
-            (1, 2, 'RIGHT'), (0, 1, 'UP'), (1, 0, 'LEFT'),
-            (2, 1, 'DOWN'),  (1, 1, 'STAY')
-        ]
-        for row_p, col_p, lbl in ACTION_LABEL_POS:
-            val = pre_motor_grid[row_p, col_p]
-            if val > 0.005:
-                text_col = 'black' if val > 0.6 else 'white'
-                ax.text(col_p, row_p, f"{val:.0%}\n{lbl}",
-                        ha='center', va='center',
-                        color=text_col, fontweight='bold', fontsize=11)
-        # Cyan border on the chosen action cell
-        chosen_action = int(np.argmax(motor_voltage[-1]))
-        chosen_positions = {0:(1,2), 1:(0,1), 2:(1,0), 3:(2,1), 4:(1,1)}
-        c_row, c_col = chosen_positions[chosen_action]
-        rect2 = mpatches.Rectangle((c_col - 0.5, c_row - 0.5), 1, 1,
-                                    linewidth=3, edgecolor='cyan', facecolor='none')
-        ax.add_patch(rect2)
-        plt.colorbar(im2, ax=ax, shrink=0.72, label='Path probability (softmax)')
-
-        # Panel 3: Shadow Raycast
-        ax = axes[2]
-        im3 = ax.imshow(shadow_map, cmap='Reds', origin='upper',
-                        vmin=0, vmax=1, interpolation='nearest')
-        # Overlay wall cells in dark grey
-        wall_overlay = np.zeros((FOV, FOV, 4))
-        wall_overlay[w_mask] = [0.2, 0.2, 0.2, 0.55]
-        ax.imshow(wall_overlay, origin='upper', interpolation='nearest')
-        ax.plot(cc, cr, 'o', color='#2196F3', ms=12, label='Agent', zorder=5)
-        if veto_r is not None:
-            ax.plot(veto_c, veto_r, 'r*', ms=18, label='VETO  wall hit', zorder=6)
-            ax.annotate('⚡', xy=(veto_c, veto_r),
-                        xytext=(veto_c + 0.7, veto_r - 0.7),
-                        fontsize=14, color='red', zorder=7)
-        ax.set_title('Panel 3: Shadow Raycast\n'
-                     '(red gradient = ghost spikes → wall hit = VETO)',
-                     fontsize=10, fontweight='bold')
-        ax.set_xticks(range(FOV)); ax.set_yticks(range(FOV))
-        ax.grid(True, lw=0.6, color='k', alpha=0.25)
-        ax.legend(fontsize=8, loc='lower right')
-        plt.colorbar(im3, ax=ax, shrink=0.72, label='Ghost spike intensity')
-
-        fig.suptitle(
-            "The Agent's Mind's Eye:  FOV  →  Pre-Motor Landscape  →  Shadow Raycast",
-            fontsize=13, fontweight='bold')
+        fig, ax = plt.subplots(figsize=(10, 4))
+        y_idx, x_idx = np.nonzero(spike_raster)
+        ax.scatter(x_idx, y_idx, s=4, c='#2196F3', alpha=0.8, marker='|')
+        ax.set_title('Readout Mesh Spike Raster (204 E-Neurons)', fontweight='bold')
+        ax.set_xlabel('Simulation Tick')
+        ax.set_ylabel('Neuron ID')
+        ax.set_xlim(-0.5, TRACE_TICKS - 0.5)
+        ax.set_ylim(-1, ag0.readout_mesh.num_E)
+        ax.grid(alpha=0.2)
         plt.tight_layout()
-        plt.savefig(os.path.join(save_dir, 'minds_eye.png'), dpi=150)
+        plt.savefig(os.path.join(save_dir, 'lsm_raster.png'), dpi=150)
         plt.close()
-        print(f"      ✅  minds_eye.png")
+        print(f"      ✅  lsm_raster.png")
 
-        print(f"\n   📊 Diagnostics: subsumption_trace.png | cpg_antiphase.png | minds_eye.png")
+        print(f"\n   📊 Diagnostics: subsumption_trace.png | cpg_antiphase.png | lsm_raster.png")
     
     def save(self, path: str):
         """Save model"""

@@ -1001,6 +1001,154 @@ Saturated Neurons:     9.6%
 ════════════════════════════════════════════════════════════════════════
 ```
 
+### Reproducing Reported Results and Evaluation
+
+This section gives command-level reproduction steps for the metrics shown above
+and for the sweep-style evaluations used in this repository.
+
+#### 1) Environment setup
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+```
+
+#### 2) Main training + closed-loop evaluation
+
+```bash
+python train_swarm_lsm.py --config configs/config_swarm.yaml
+```
+
+Verbose per-tick evaluation logs:
+
+```bash
+python train_swarm_lsm.py --config configs/config_swarm.yaml --log-ticks
+```
+
+#### 3) Quick smoke evaluation
+
+```bash
+python test_eval_quick.py
+```
+
+Use this for a fast sanity check (short run, not benchmark quality).
+
+#### 4) Core sweep + ablation evaluation
+
+```bash
+python ablation_eval.py \
+    --mode both \
+    --config configs/config_swarm.yaml \
+    --checkpoint checkpoints/lsm/phase1_cortex.pt \
+    --episodes 20 \
+    --agent-counts 10 \
+    --num-agents 10 \
+    --fov-size 7 \
+    --agent-sweep-fov 7 \
+    --ablations full,no_shadow,no_ghost,no_cpg \
+    --out-dir logs
+```
+
+This matches the structure used by existing sweep logs and writes a full summary
+CSV plus per-episode records.
+
+#### 5) Diagnostics-only figures
+
+```bash
+python ablation_eval.py \
+    --mode diagnostics_only \
+    --config configs/config_swarm.yaml \
+    --checkpoint checkpoints/lsm/phase1_cortex.pt \
+    --num-agents 10 \
+    --diagnostics-variant full \
+    --out-dir logs
+```
+
+#### 6) Multi-seed reproducibility loop
+
+```bash
+for s in 1234 1235 1236 1237 1238; do
+    python ablation_eval.py \
+        --mode both \
+        --config configs/config_swarm.yaml \
+        --checkpoint checkpoints/lsm/phase1_cortex.pt \
+        --episodes 20 \
+        --agent-counts 10 \
+        --num-agents 10 \
+        --fov-size 7 \
+        --agent-sweep-fov 7 \
+        --ablations full,no_shadow,no_ghost,no_cpg \
+        --seed-base "$s" \
+        --out-dir logs
+done
+```
+
+Aggregate `summary.csv` files from each run for mean/std/CI reporting.
+
+#### Dataset contract required by the scripts
+
+The loaders/evaluators expect:
+
+- `dataset/<name>/train/case_*/`
+- `dataset/<name>/valid/case_*/`
+
+Each `case_*` directory must include:
+
+- `states.npy`
+- `trajectory_record.npy`
+- `gso.npy`
+- `input.yaml` (required by evaluation and several training paths)
+
+#### Output artifacts and where to find them
+
+Training/evaluation run (`train_swarm_lsm.py`) writes:
+
+- `logs/swarm_<timestamp>/swarm.pt`
+- `logs/swarm_<timestamp>/summary.txt`
+- `logs/swarm_<timestamp>/subsumption_trace.png`
+- `logs/swarm_<timestamp>/cpg_antiphase.png`
+- `logs/swarm_<timestamp>/lsm_raster.png`
+
+Sweep/ablation run (`ablation_eval.py`) writes:
+
+- `logs/sweep_<timestamp>/summary.csv`
+- `logs/sweep_<timestamp>/per_episode.csv` (if episodes completed)
+- `logs/sweep_<timestamp>/ablation_metrics.png`
+- `logs/sweep_<timestamp>/summary.txt`
+- `logs/sweep_<timestamp>/qualitative/*.png`
+
+Diagnostics-only mode writes:
+
+- `logs/sweep_<timestamp>/diagnostics/subsumption_trace.png`
+- `logs/sweep_<timestamp>/diagnostics/cpg_antiphase.png`
+- `logs/sweep_<timestamp>/diagnostics/lsm_raster.png`
+
+#### PDF-to-repo result mapping (explicit confidence)
+
+`LSM_FOR_MAPF.pdf` exists in this repository, but direct text extraction from the
+PDF is not reliable in this environment. The mapping below is therefore based on
+verified repository metrics and scripts.
+
+| Paper/result category | Repo metric(s) | Script path | Confidence |
+|---|---|---|---|
+| Task success | `success_rate`, `goal_reach_rate` | `train_swarm_lsm.py` -> `SwarmTrainer.evaluate(...)` | High |
+| Safety/collision behavior | `avg_collisions`, `total_collisions`, `collision_events_total`, `collided_agent_rate` | `train_swarm_lsm.py`, `ablation_eval.py` | High |
+| Efficiency | `avg_timesteps`, `avg_final_distance`, `avg_makespan` | `train_swarm_lsm.py`, `ablation_eval.py` | High |
+| Neural activity health | `spike_mean`, `spike_max`, `dead_neuron_frac`, `saturated_frac` | `SwarmTrainer.evaluate(...)` | High |
+| Exact figure/table correspondence in PDF | N/A (not directly parsed) | `LSM_FOR_MAPF.pdf` | Medium |
+
+#### Reproducibility notes and caveats
+
+- `ablation_eval.py` seeds each episode via `--seed-base`.
+- `train_swarm_lsm.py` does not set a global seed by default.
+- Prefer `configs/config_swarm.yaml` for reproduction. `config_swarm_hybrid.yaml`
+    currently contains training-key names that differ from what the loader in
+    `train_swarm_lsm.py` expects.
+
+When comparing runs, always report: config file, checkpoint, episodes, seed(s),
+and command line used.
+
 **Notes on the spike health report:**
 - `Dead Neurons: 83.4%` — the dead-neuron metric reports neurons that never
   fired across *all* timesteps in the eval batch. With a low gain (`×1.5`) and
@@ -1060,8 +1208,8 @@ Saturated Neurons:     9.6%
 ### Installation
 
 ```bash
-git clone https://github.com/ARNAVVGUPTAA/MAPF-SNN.git
-cd MAPF-SNN
+git clone https://github.com/ARNAVVGUPTAA/MAPF-GNN.git
+cd MAPF-GNN
 pip install -r requirements.txt
 ```
 
