@@ -1413,58 +1413,6 @@ All other weights (obs_input_proj, obs_recurrent, readout_input, readout_recurre
 projection neurons) are fixed at initialisation and need only be quantised once —
 they never change.
 
-### Target Platforms
-
-| Platform | Compatible? | Notes |
-|---|---|---|
-| Intel Loihi 2 | ✅ | Native LIF, on-chip learning not needed |
-| IBM TrueNorth | ✅ | Requires 1-bit weight quantisation (additional step) |
-| SpiNNaker 2 | ✅ | Software-configurable LIF, flexible routing |
-| BrainScaleS-2 | ✅ | Analog LIF, requires calibration |
-| Akida (BrainChip) | ✅ | Commercial SNN chip, INT8 weights |
-
----
-
-## 18. References and Citation
-
-### Core Papers
-
-1. Maass, W., Natschläger, T., Markram, H. (2002). *Real-time computing without stable
-   states: A new framework for neural computation.* Neural Computation, 14(11).
-
-2. Brooks, R. A. (1986). *A robust layered control system for a mobile robot.*
-   IEEE Journal on Robotics and Automation, 2(1), 14–23. — **Subsumption Architecture**
-
-3. Grillner, S. (1985). *Neurobiological bases of rhythmic motor acts in vertebrates.*
-   Science, 228(4696), 143–149. — **CPG biology**
-
-4. Neftci, E. O., Mostafa, H., Zenke, F. (2019). *Surrogate gradient learning in
-   spiking neural networks.* IEEE Signal Processing Magazine, 36(6).
-
-5. Davies, M. et al. (2018). *Loihi: A neuromorphic manycore processor with on-chip
-   learning.* IEEE Micro, 38(1), 82–99.
-
-6. Sharon, G., Stern, R., Felner, A., Sturtevant, N. R. (2015). *Conflict-based
-   search for optimal multi-agent pathfinding.* Artificial Intelligence, 219, 40–66.
-
-7. Redish, A. D. (2016). *Vicarious trial and error.* Nature Reviews Neuroscience,
-   17(3), 147–159. — **Ghost Antenna / VTE inspiration**
-
-8. Fonio, E. et al. (2012). *A locally-based global-direction navigation mechanism
-   in ants.* PLOS Computational Biology.
-
-### Citation
-
-```bibtex
-@misc{bdsm_mapf_2026,
-  title   = {{BDSM}: Brains Don't Simply Multiply —
-             Hardware-Native Neuromorphic Swarm Intelligence for MAPF},
-  author  = {Gupta, Arnav},
-  year    = {2026},
-  url     = {https://github.com/ARNAVVGUPTAA/MAPF-SNN}
-}
-```
-
 ---
 
 <p align="center">
