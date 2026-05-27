@@ -184,16 +184,23 @@ class TopographicIntentMap(EINeuronMesh):
         
         E_spikes = self.get_E_neurons(spike_accumulator)
 
-        # BDSM FIX: Spatial Forcefield Veto
-        # If we tried to move but our target cell was crushed by a neighbour, yield!
+        # Spatial Forcefield Veto: yield only when a neighbour's spikes have
+        # actually suppressed our target-direction neurons.  We require a
+        # meaningful inhibitory signal (total neighbour spike mass > 0.5) so
+        # that the check never fires in the cold / no-neighbour case.
+        has_real_inhibition = (
+            neighbor_E_spikes is not None
+            and neighbor_E_spikes.shape[0] > 0
+            and neighbor_E_spikes.abs().sum().item() > 0.5
+        )
         intent_veto = False
-        if action != 4:
+        if action != 4 and has_real_inhibition:
             dx, dy = self.action_to_pos[action]
             cell_idx = (1 + dy) * 3 + (1 + dx)
             e_start = min(cell_idx * self.neurons_per_cell, self.num_E)
             e_end   = min(e_start + self.neurons_per_cell, self.num_E)
             my_target_spikes = E_spikes[e_start:e_end].sum().item()
-            if my_target_spikes < (num_ticks * 2.0):  # heavily suppressed by neighbour
+            if my_target_spikes < (num_ticks * 2.0):
                 intent_veto = True
 
         return E_spikes, intent_veto
@@ -978,6 +985,7 @@ class SwarmLSM(nn.Module):
 
         # Clear noradrenaline injection flags after forward pass is complete
         self.inject_noradrenaline = {}
+        self.last_should_stay = cached_should_stay
         
         # Return veto flags so the training loop knows a mistake happened (pre-subsumption state)
         # Return cached_readout_E so evaluate() can track real live spike health
