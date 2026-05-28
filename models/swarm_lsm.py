@@ -39,6 +39,288 @@ from tqdm import tqdm
 
 # SpikingJelly for proper LIF dynamics
 from spikingjelly.activation_based import neuron, functional, layer
+from dataclasses import dataclass
+
+
+# =============================================================================
+# HODGKIN-HUXLEY LTS NEURON (Pospischil 2008, Table 3.1)
+# =============================================================================
+# Drop-in replacement for SpikingJelly LIFNode.
+# Implements the Low-Threshold Spiking (LTS) cortical neuron with:
+#   - Fast Na+ (m,h), Delayed-Rectifier K+ (n), M-current (p), T-type Ca2+ (s,u)
+# The T-Ca channel (g_T) gives LTS its characteristic low-threshold burst on
+# release from hyperpolarisation — absent in plain LIF.
+#
+# Design:
+#   HHLTSParams   — frozen dataclass of all biophysical constants
+#   HHLTSGates    — pure static gate-kinetics (no state, no allocations)
+#   HHLTSNeuron   — nn.Module, stateful, compatible with functional.reset_net()
+#   _make_neuron  — factory: 'lif' → LIFNode | 'hh' → HHLTSNeuron
+# =============================================================================
+
+@dataclass
+class HHLTSParams:
+    """
+    LTS neuron parameters from Pospischil 2008, Table 3.1.
+    All conductances in S/cm², potentials in mV, time in ms, current in μA/cm².
+    """
+    # --- maximal conductances (S/cm²) ---
+    g_Na:       float = 0.05       # fast sodium
+    g_K:        float = 0.005      # delayed-rectifier potassium
+    g_M:        float = 3e-5       # M-current (slow K+ adaptation)
+    g_T:        float = 4e-4       # T-type calcium (gives LTS character)
+    g_L:        float = 1e-5       # leak
+    # --- reversal potentials (mV) ---
+    E_Na:       float = 50.0
+    E_K:        float = -100.0
+    E_Ca:       float = 120.0
+    E_L:        float = -75.0      # = resting potential for LTS
+    # --- membrane ---
+    C_m:        float = 1.0        # μF/cm²
+    v_init:     float = -75.0      # mV, resting potential
+    # --- simulation ---
+    dt:         float = 0.1        # ms per Euler step
+    v_spike_thr: float = 0.0       # mV, threshold for spike detection
+    # --- input scaling: maps normalised network current → μA/cm² ---
+    # Tuned so that typical LIF-range inputs (0–5) drive HH to spike at
+    # a comparable rate. Increase to make neurons more excitable.
+    I_scale:    float = 50.0
+    # --- M-current time constant ---
+    tau_max_p:  float = 1000.0     # ms
+    # --- T-Ca temperature factor ---
+    phi_g:      float = 3.0
+
+
+class HHLTSGates:
+    """
+    Static methods for LTS gate kinetics (Pospischil 2008).
+    All inputs/outputs are PyTorch tensors; no instance state.
+
+    Convention: alpha/beta formulations for m,h,n; inf/tau for p,s,u.
+    A small epsilon (1e-7) guards singularities at the 0/0 points of
+    alpha_m (V=−52), beta_m (V=−25), alpha_n (V=−47).
+    """
+
+    # ── Fast Na+ channel ───────────────────────────────────────────────────────
+    @staticmethod
+    def alpha_m(V: torch.Tensor) -> torch.Tensor:
+        dv = -(V + 52.0)
+        return 0.32 * dv / (torch.exp(dv / 4.0) - 1.0 + 1e-7)
+
+    @staticmethod
+    def beta_m(V: torch.Tensor) -> torch.Tensor:
+        dv = V + 25.0
+        return 0.28 * dv / (torch.exp(dv / 5.0) - 1.0 + 1e-7)
+
+    @staticmethod
+    def alpha_h(V: torch.Tensor) -> torch.Tensor:
+        return 0.128 * torch.exp(-(V + 48.0) / 18.0)
+
+    @staticmethod
+    def beta_h(V: torch.Tensor) -> torch.Tensor:
+        return 4.0 / (1.0 + torch.exp(-(V + 25.0) / 5.0))
+
+    # ── Delayed-rectifier K+ ───────────────────────────────────────────────────
+    @staticmethod
+    def alpha_n(V: torch.Tensor) -> torch.Tensor:
+        dv = -(V + 47.0)
+        return 0.032 * dv / (torch.exp(dv / 5.0) - 1.0 + 1e-7)
+
+    @staticmethod
+    def beta_n(V: torch.Tensor) -> torch.Tensor:
+        return 0.5 * torch.exp(-(V + 52.0) / 40.0)
+
+    # ── M-current (slow K+ adaptation) ────────────────────────────────────────
+    @staticmethod
+    def p_inf(V: torch.Tensor) -> torch.Tensor:
+        return 1.0 / (1.0 + torch.exp(-(V + 35.0) / 10.0))
+
+    @staticmethod
+    def tau_p(V: torch.Tensor, tau_max: float) -> torch.Tensor:
+        return tau_max / (3.3 * torch.exp((V + 35.0) / 20.0) + torch.exp(-(V + 35.0) / 20.0))
+
+    # ── T-type Ca2+ (gives LTS its burst) ─────────────────────────────────────
+    @staticmethod
+    def s_inf(V: torch.Tensor) -> torch.Tensor:
+        return 1.0 / (1.0 + torch.exp(-(V + 57.0) / 6.2))
+
+    @staticmethod
+    def tau_s(V: torch.Tensor, phi_g: float) -> torch.Tensor:
+        return (
+            0.612 + 1.0 / (torch.exp(-(V + 132.0) / 16.7) + torch.exp((V + 16.8) / 18.2))
+        ) / phi_g
+
+    @staticmethod
+    def u_inf(V: torch.Tensor) -> torch.Tensor:
+        return 1.0 / (1.0 + torch.exp((V + 81.0) / 4.0))
+
+    @staticmethod
+    def tau_u(V: torch.Tensor, phi_g: float) -> torch.Tensor:
+        """Piecewise T-Ca inactivation time constant."""
+        slow = 28.0 + torch.exp(-(V + 22.0) / 10.5)
+        fast = (1.0 / (
+            torch.exp((V + 467.0) / 66.6) + torch.exp(-(V + 22.0) / 10.5)
+        )) / phi_g
+        return torch.where(V >= -80.0, slow, fast)
+
+
+class HHLTSNeuron(nn.Module):
+    """
+    Hodgkin-Huxley LTS neuron — drop-in for SpikingJelly LIFNode.
+
+    Interface identical to LIFNode:
+        spikes = neuron(input_current)   # [N] → [N] binary float
+
+    State (all registered buffers → moves with .to(device)):
+        V     membrane potential (mV)
+        m,h   Na+ activation/inactivation
+        n     K-dr activation
+        p_m   M-current activation
+        s,u   T-Ca activation/inactivation
+
+    Frozen — no trainable parameters. Intended as a reservoir.
+    Compatible with functional.reset_net() because reset() is defined.
+
+    Args:
+        num_neurons: Population size (must match the linear layer output width).
+        params:      HHLTSParams instance; None → default LTS constants.
+    """
+
+    def __init__(self, num_neurons: int, params: Optional[HHLTSParams] = None):
+        super().__init__()
+        self.num_neurons = num_neurons
+        self.hp = params if params is not None else HHLTSParams()
+
+        # Membrane potential + previous V for threshold-crossing detection
+        self.register_buffer('V',     torch.full((num_neurons,), self.hp.v_init))
+        self.register_buffer('V_prev',torch.full((num_neurons,), self.hp.v_init))
+        # Gating variables
+        self.register_buffer('m',  torch.zeros(num_neurons))
+        self.register_buffer('h',  torch.ones(num_neurons))
+        self.register_buffer('n',  torch.zeros(num_neurons))
+        self.register_buffer('p_m',torch.zeros(num_neurons))  # M-current gate
+        self.register_buffer('s',  torch.zeros(num_neurons))  # T-Ca activation
+        self.register_buffer('u',  torch.ones(num_neurons))   # T-Ca inactivation
+
+        self._init_gates_at_rest()
+
+    # ------------------------------------------------------------------
+    def _init_gates_at_rest(self) -> None:
+        """Set gating variables to their steady-state at V_rest."""
+        with torch.no_grad():
+            V = self.V
+            am = HHLTSGates.alpha_m(V); bm = HHLTSGates.beta_m(V)
+            ah = HHLTSGates.alpha_h(V); bh = HHLTSGates.beta_h(V)
+            an = HHLTSGates.alpha_n(V); bn = HHLTSGates.beta_n(V)
+            self.m.copy_((am / (am + bm + 1e-9)).clamp(0.0, 1.0))
+            self.h.copy_((ah / (ah + bh + 1e-9)).clamp(0.0, 1.0))
+            self.n.copy_((an / (an + bn + 1e-9)).clamp(0.0, 1.0))
+            self.p_m.copy_(HHLTSGates.p_inf(V))
+            self.s.copy_(HHLTSGates.s_inf(V))
+            self.u.copy_(HHLTSGates.u_inf(V))
+
+    def reset(self) -> None:
+        """Reset to resting state (called by functional.reset_net)."""
+        with torch.no_grad():
+            self.V.fill_(self.hp.v_init)
+            self.V_prev.fill_(self.hp.v_init)
+        self._init_gates_at_rest()
+
+    # ------------------------------------------------------------------
+    @torch.no_grad()
+    def forward(self, I_input: torch.Tensor) -> torch.Tensor:
+        """
+        One Euler step of HH-LTS dynamics.
+
+        Args:
+            I_input: [num_neurons] normalised input (same scale as LIF input).
+
+        Returns:
+            spikes: [num_neurons] binary float (1.0 = spike this step).
+        """
+        hp  = self.hp
+        V   = self.V
+        m, h, n         = self.m,  self.h,  self.n
+        p_m, s, u       = self.p_m, self.s, self.u
+
+        # Scale normalised input to biophysical units (μA/cm²)
+        I_ext = I_input * hp.I_scale
+
+        # ── Gate kinetics ──────────────────────────────────────────────────────
+        am  = HHLTSGates.alpha_m(V);  bm = HHLTSGates.beta_m(V)
+        ah  = HHLTSGates.alpha_h(V);  bh = HHLTSGates.beta_h(V)
+        an  = HHLTSGates.alpha_n(V);  bn = HHLTSGates.beta_n(V)
+
+        p_i  = HHLTSGates.p_inf(V)
+        tp   = HHLTSGates.tau_p(V, hp.tau_max_p)
+
+        s_i  = HHLTSGates.s_inf(V)
+        ts   = HHLTSGates.tau_s(V, hp.phi_g)
+        u_i  = HHLTSGates.u_inf(V)
+        tu   = HHLTSGates.tau_u(V, hp.phi_g)
+
+        dt = hp.dt
+
+        # ── Euler update for gates ─────────────────────────────────────────────
+        m_new  = (m  + (am  * (1.0 - m)  - bm  * m)           * dt).clamp(0.0, 1.0)
+        h_new  = (h  + (ah  * (1.0 - h)  - bh  * h)           * dt).clamp(0.0, 1.0)
+        n_new  = (n  + (an  * (1.0 - n)  - bn  * n)           * dt).clamp(0.0, 1.0)
+        pm_new = (p_m + ((p_i - p_m) / tp.clamp(min=1e-6))    * dt).clamp(0.0, 1.0)
+        s_new  = (s  + ((s_i - s)   / ts.clamp(min=1e-6))     * dt).clamp(0.0, 1.0)
+        u_new  = (u  + ((u_i - u)   / tu.clamp(min=1e-6))     * dt).clamp(0.0, 1.0)
+
+        # ── Ionic currents (using updated gates) ───────────────────────────────
+        I_Na = hp.g_Na * (m_new ** 3) * h_new * (V - hp.E_Na)
+        I_K  = hp.g_K  * (n_new ** 4)          * (V - hp.E_K)
+        I_M  = hp.g_M  * pm_new                 * (V - hp.E_K)
+        I_T  = hp.g_T  * (s_new ** 2) * u_new  * (V - hp.E_Ca)
+        I_L  = hp.g_L                           * (V - hp.E_L)
+
+        # ── Membrane equation ──────────────────────────────────────────────────
+        dV    = (I_ext - I_Na - I_K - I_M - I_T - I_L) * (dt / hp.C_m)
+        V_new = V + dV
+
+        # ── Spike detection: upward threshold crossing ─────────────────────────
+        spikes = ((V_new >= hp.v_spike_thr) & (V < hp.v_spike_thr)).float()
+
+        # ── Commit state ───────────────────────────────────────────────────────
+        self.V_prev.copy_(V)
+        self.V.copy_(V_new)
+        self.m.copy_(m_new);  self.h.copy_(h_new);  self.n.copy_(n_new)
+        self.p_m.copy_(pm_new); self.s.copy_(s_new); self.u.copy_(u_new)
+
+        return spikes
+
+
+def _reset_lif(node: nn.Module) -> None:
+    """
+    Reset a single neuron node (LIF or HHLTSNeuron).
+
+    Calls node.reset() directly rather than going through functional.reset_net(),
+    which would emit a noisy 'not MemoryModule' warning for every HHLTSNeuron.
+    Both LIFNode and HHLTSNeuron implement reset(), so this is always safe.
+    """
+    if hasattr(node, 'reset'):
+        node.reset()
+
+
+def _make_neuron(num_neurons: int, tau: float, neuron_type: str = 'lif') -> nn.Module:
+    """
+    Factory: create a neuron node for use inside EINeuronMesh or standalone.
+
+    Args:
+        num_neurons: Population size (needed for HH state buffers; ignored by LIF).
+        tau:         LIF membrane time constant (ignored for HH).
+        neuron_type: 'lif' (default) or 'hh'.
+
+    Returns:
+        LIFNode  — if neuron_type == 'lif'
+        HHLTSNeuron — if neuron_type == 'hh'
+    """
+    if neuron_type == 'hh':
+        return HHLTSNeuron(num_neurons=num_neurons)
+    else:
+        return neuron.LIFNode(tau=tau, v_threshold=1.0, v_reset=0.0)
 
 
 # === E/I NEURON MESH BASE ===
@@ -53,14 +335,14 @@ class EINeuronMesh(nn.Module):
     - I neurons only local
     - LIF dynamics from SpikingJelly
     """
-    def __init__(self, num_neurons: int, tau: float = 2.0):
+    def __init__(self, num_neurons: int, tau: float = 2.0, neuron_type: str = 'lif'):
         super().__init__()
         self.num_neurons = num_neurons
         self.num_E = int(num_neurons * 0.8)
         self.num_I = num_neurons - self.num_E
-        
-        # LIF neurons
-        self.lif = neuron.LIFNode(tau=tau, v_threshold=1.0, v_reset=0.0)
+
+        # Neuron node — LIF or HH, selected by neuron_type
+        self.lif = _make_neuron(num_neurons, tau, neuron_type)
         
         # E/I sign mask for recurrent connections (registered buffer → moves with .to(device))
         self.register_buffer('ei_mask', torch.cat([
@@ -83,9 +365,9 @@ class TopographicIntentMap(EINeuronMesh):
     Agent moving EAST → fires E neurons at (1,0) position
     Only E spikes broadcast to neighbors
     """
-    def __init__(self):
+    def __init__(self, neuron_type: str = 'lif'):
         # 9 positions × 16 neurons per position = 144 total
-        super().__init__(num_neurons=144, tau=2.0)
+        super().__init__(num_neurons=144, tau=2.0, neuron_type=neuron_type)
         
         self.grid_size = 3
         self.neurons_per_cell = 16
@@ -208,14 +490,14 @@ class TopographicIntentMap(EINeuronMesh):
 class CPG(EINeuronMesh):
     """
     Spiking neural oscillator with two populations.
-    
+
     Peak population (move) and Trough population (stay).
     Mutual inhibition creates oscillation.
     Weak coupling between agents for anti-phase locking.
     """
-    def __init__(self):
+    def __init__(self, neuron_type: str = 'lif'):
         # 32 total neurons: 16 peak, 16 trough
-        super().__init__(num_neurons=32, tau=3.0)
+        super().__init__(num_neurons=32, tau=3.0, neuron_type=neuron_type)
         
         self.peak_size = 16
         self.trough_size = 16
@@ -246,7 +528,7 @@ class CPG(EINeuronMesh):
         """Reset CPG state"""
         self.spike_history.zero_()
         self.adaptation.zero_()
-        functional.reset_net(self.lif)
+        _reset_lif(self.lif)
     
     def forward(
         self,
@@ -396,12 +678,13 @@ class GhostAntenna(nn.Module):
     
     Biological analog: Rodent vicarious trial & error, hippocampal replay.
     """
-    def __init__(self, tau: float = 2.0):
+    def __init__(self, tau: float = 2.0, neuron_type: str = 'lif'):
         super().__init__()
-        self.lif = neuron.LIFNode(tau=tau, v_threshold=1.0, v_reset=0.0)
+        # 5 neurons: one scent integrator per action
+        self.lif = _make_neuron(5, tau, neuron_type)
 
     def reset(self):
-        functional.reset_net(self.lif)
+        _reset_lif(self.lif)
 
     def forward(
         self,
@@ -451,7 +734,7 @@ class GhostAntenna(nn.Module):
 
         current = scent * gain
 
-        functional.reset_net(self.lif)
+        _reset_lif(self.lif)
         acc = torch.zeros(5, device=fov_walls.device)
         for _ in range(num_ticks):
             acc += self.lif(current)
@@ -479,50 +762,50 @@ class AgentLSM(nn.Module):
         enable_cpg: bool = True,
         enable_shadow: bool = True,
         enable_ghost: bool = True,
+        neuron_type: str = 'lif',
     ):
         super().__init__()
         self.agent_id = agent_id
         self.enable_cpg = enable_cpg
         self.enable_shadow = enable_shadow
         self.enable_ghost = enable_ghost
-        
+        self.neuron_type = neuron_type
+
         # === OBSERVATION PROCESSING MESH ===
-        # LIF mesh for encoding FOV (replaces Tanh reservoir)
-        self.obs_mesh = EINeuronMesh(num_neurons=256, tau=2.0)
+        self.obs_mesh = EINeuronMesh(num_neurons=256, tau=2.0, neuron_type=neuron_type)
         self.obs_input_proj = layer.Linear(2 * 7 * 7, 256, bias=False)
         self.obs_recurrent = layer.Linear(256, 256, bias=False)
         nn.init.sparse_(self.obs_recurrent.weight, sparsity=0.85)
-        
+
         # Projection neurons: obs mesh E → compressed
         self.obs_to_readout = ProjectionNeurons(self.obs_mesh.num_E, 64)
-        
+
         # === THREE CORE MODULES ===
-        self.intent_map = TopographicIntentMap()
-        self.cpg = CPG()
+        self.intent_map = TopographicIntentMap(neuron_type=neuron_type)
+        self.cpg = CPG(neuron_type=neuron_type)
         self.shadow = ShadowCaster(fov_size=7)
-        
+
         # === READOUT MESH ===
-        # LIF mesh for action selection (replaces Linear readout)
-        self.readout_mesh = EINeuronMesh(num_neurons=256, tau=1.5)
+        self.readout_mesh = EINeuronMesh(num_neurons=256, tau=1.5, neuron_type=neuron_type)
         self.readout_input = layer.Linear(64, 256, bias=False)
         self.readout_recurrent = layer.Linear(256, 256, bias=False)
         nn.init.sparse_(self.readout_recurrent.weight, sparsity=0.9)
-        
-        # Final action neurons (5 actions, no E/I split here - output layer)
-        self.action_neurons = neuron.LIFNode(tau=2.0, v_threshold=1.0)
+
+        # Final action neurons (5 actions, no E/I split here – output layer)
+        self.action_neurons = _make_neuron(5, 2.0, neuron_type)
         self.action_weights = layer.Linear(self.readout_mesh.num_E, 5, bias=False)
 
         # RM-STDP eligibility trace: same shape as action_weights [5, num_E]
         self.register_buffer('eligibility_trace', torch.zeros_like(self.action_weights.weight))
 
         # GhostAntenna: 1-step vicarious trial & error (local lookahead)
-        self.ghost_antenna = GhostAntenna()
+        self.ghost_antenna = GhostAntenna(neuron_type=neuron_type)
 
     def reset(self):
         """Reset all spiking meshes"""
-        functional.reset_net(self.obs_mesh.lif)
-        functional.reset_net(self.readout_mesh.lif)
-        functional.reset_net(self.action_neurons)
+        _reset_lif(self.obs_mesh.lif)
+        _reset_lif(self.readout_mesh.lif)
+        _reset_lif(self.action_neurons)
         self.cpg.reset()
         self.shadow.reset()
         self.ghost_antenna.reset()
@@ -675,6 +958,7 @@ class SwarmLSM(nn.Module):
         enable_shadow: bool = True,
         enable_ghost: bool = True,
         enable_veto_bridge: bool = True,
+        neuron_type: str = 'lif',
     ):
         super().__init__()
         self.num_agents = num_agents
@@ -683,14 +967,16 @@ class SwarmLSM(nn.Module):
         self.enable_shadow = enable_shadow
         self.enable_ghost = enable_ghost
         self.enable_veto_bridge = enable_veto_bridge
-        
-        # Create independent spiking agents
+        self.neuron_type = neuron_type
+
+        # Create independent spiking agents (all share the same neuron_type)
         self.agents = nn.ModuleList([
             AgentLSM(
                 agent_id=i,
                 enable_cpg=enable_cpg,
                 enable_shadow=enable_shadow,
                 enable_ghost=enable_ghost,
+                neuron_type=neuron_type,
             ) for i in range(num_agents)
         ])
         
@@ -871,10 +1157,10 @@ class SwarmLSM(nn.Module):
                     for j in range(self.num_agents) if j != agent_id
                 ])  # [N-1, num_E]
 
-                # Reset LIF state so the second run is clean
-                functional.reset_net(ag.intent_map.lif)
+                # Reset neuron state so the second run is clean
+                _reset_lif(ag.intent_map.lif)
                 if self.enable_cpg:
-                    functional.reset_net(ag.cpg.lif)
+                    _reset_lif(ag.cpg.lif)
 
                 tentative = int(torch.argmax(cached_action_acc[agent_id]).item())
                 intent_E, intent_veto = ag.intent_map(
@@ -2239,9 +2525,9 @@ class SwarmTrainer:
         # Real tick-by-tick trace including Ghost Antenna and dynamic Shadow VETO.
         # No frustration hormone (deleted from real forward pass).
         # ══════════════════════════════════════════════════════════════════════
-        functional.reset_net(ag0.obs_mesh.lif)
-        functional.reset_net(ag0.readout_mesh.lif)
-        functional.reset_net(ag0.ghost_antenna.lif)
+        _reset_lif(ag0.obs_mesh.lif)
+        _reset_lif(ag0.readout_mesh.lif)
+        _reset_lif(ag0.ghost_antenna.lif)
 
         obs_flat = corridor_obs.flatten()
         obs_inp  = ag0.obs_input_proj(obs_flat) * 1.5

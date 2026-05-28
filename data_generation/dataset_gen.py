@@ -146,6 +146,117 @@ def cbs_search_worker(env, result_queue):
     result_queue.put(solution)
 
 
+def lacam_data_gen(input_dict, output_path, lacam_bin, timeout=30):
+    """
+    Generate a MAPF solution using the LaCAM0 binary.
+    Writes solution.yaml and input.yaml in the same format as data_gen (CBS).
+
+    Args:
+        input_dict: Standard map/agent dict from gen_input().
+        output_path: Directory to write solution.yaml + input.yaml into.
+        lacam_bin:   Absolute path to the lacam0 executable.
+        timeout:     Time limit in seconds.
+    """
+    import subprocess, tempfile
+
+    os.makedirs(output_path, exist_ok=True)
+
+    param      = input_dict
+    dimensions = param["map"]["dimensions"]   # [W, H] — cols, rows
+    W, H       = dimensions[0], dimensions[1]
+    obstacles  = param["map"]["obstacles"]
+    agents     = param["agents"]
+    n          = len(agents)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        map_path  = os.path.join(tmp, 'env.map')
+        scen_path = os.path.join(tmp, 'agents.scen')
+        out_path  = os.path.join(tmp, 'result.txt')
+
+        # ── map file ──────────────────────────────────────────────────────────
+        grid = [['.' for _ in range(W)] for _ in range(H)]
+        for obs in obstacles:
+            ox, oy = int(obs[0]), int(obs[1])
+            if 0 <= ox < W and 0 <= oy < H:
+                grid[oy][ox] = '@'
+        with open(map_path, 'w') as f:
+            f.write(f"type octile\nheight {H}\nwidth {W}\nmap\n")
+            for row in grid:
+                f.write(''.join(row) + '\n')
+
+        # ── scen file (col, row convention — same as CBS x, y) ───────────────
+        with open(scen_path, 'w') as f:
+            f.write("version 1\n")
+            for ag in agents:
+                sx, sy = ag["start"][0], ag["start"][1]
+                gx, gy = ag["goal"][0],  ag["goal"][1]
+                f.write(f"0\tenv.map\t{W}\t{H}\t{sx}\t{sy}\t{gx}\t{gy}\t0\n")
+
+        # ── call LaCAM binary ─────────────────────────────────────────────────
+        try:
+            subprocess.run(
+                [lacam_bin, '-m', map_path, '-i', scen_path,
+                 '-N', str(n), '-o', out_path, '-v', '0', '-t', str(timeout)],
+                timeout=timeout + 5,
+                capture_output=True,
+            )
+        except subprocess.TimeoutExpired:
+            print(f" LaCAM timed out for {output_path}")
+            return
+        except FileNotFoundError:
+            print(f" LaCAM binary not found: {lacam_bin}")
+            raise
+
+        if not os.path.exists(out_path):
+            return
+
+        with open(out_path) as f:
+            content = f.read()
+
+        if 'solved=1' not in content:
+            return
+
+        # ── parse paths ────────────────────────────────────────────────────────
+        # LaCAM output format: each numbered line is ONE TIMESTEP, not an agent.
+        # "t:(x0,y0),(x1,y1),...,(xN-1,yN-1),"  — N positions per line.
+        paths = {i: [] for i in range(n)}
+        for line in content.splitlines():
+            if not line:
+                continue
+            colon_idx = line.find(':')
+            if colon_idx < 0:
+                continue
+            if not line[:colon_idx].strip().isdigit():
+                continue   # skip header lines (solution=, map_file=, etc.)
+            try:
+                pos_str   = line[colon_idx + 1:].strip().rstrip(',')
+                positions = pos_str.split('),(')
+                for agent_idx, pos in enumerate(positions):
+                    if agent_idx >= n:
+                        break
+                    x, y = pos.strip('()').split(',')
+                    paths[agent_idx].append((int(x), int(y)))
+            except (ValueError, IndexError):
+                continue
+
+        if not all(paths[i] for i in range(n)):
+            return   # incomplete parse
+
+        # ── convert to CBS solution.yaml format ───────────────────────────────
+        solution = {}
+        for i, ag in enumerate(agents):
+            solution[ag["name"]] = [
+                {"t": t, "x": col, "y": row}
+                for t, (col, row) in enumerate(paths[i])
+            ]
+        cost = sum(len(paths[i]) - 1 for i in range(n))
+
+        with open(os.path.join(output_path, "solution.yaml"), 'w') as f:
+            yaml.safe_dump({"schedule": solution, "cost": cost}, f)
+        with open(os.path.join(output_path, "input.yaml"), 'w') as f:
+            yaml.safe_dump(param, f)
+
+
 def data_gen(input_dict, output_path, timeout=30):
     os.makedirs(output_path, exist_ok=True)
     param = input_dict
@@ -186,10 +297,21 @@ def data_gen(input_dict, output_path, timeout=30):
         yaml.safe_dump(param, parameters_path_f)
 
 
-def create_solutions(path, num_cases, config, max_attempts=5, timeout=30):
+def create_solutions(path, num_cases, config, max_attempts=5, timeout=30,
+                     solver='lacam', lacam_bin=None):
+    """
+    Generate MAPF solution files for num_cases instances.
+
+    Args:
+        solver:    'lacam' (default, fast) or 'cbs' (slower, may time out).
+        lacam_bin: Path to the lacam0 binary (required when solver='lacam').
+    """
+    if solver == 'lacam' and lacam_bin is None:
+        raise ValueError("lacam_bin must be provided when solver='lacam'")
+
     os.makedirs(path, exist_ok=True)
     cases_ready = len(os.listdir(path))
-    print("Generating solutions")
+    print(f"Generating solutions  [solver={solver}]")
     for i in range(cases_ready, num_cases):
         if i % 25 == 0:
             print(f"Solution -- [{i}/{num_cases}]")
@@ -200,16 +322,21 @@ def create_solutions(path, num_cases, config, max_attempts=5, timeout=30):
             case_path = os.path.join(path, f"case_{i}")
             if os.path.exists(case_path):
                 shutil.rmtree(case_path)
-            data_gen(inpt, case_path, timeout=timeout)
+
+            if solver == 'lacam':
+                lacam_data_gen(inpt, case_path, lacam_bin=lacam_bin, timeout=timeout)
+            else:
+                data_gen(inpt, case_path, timeout=timeout)
+
             if os.path.exists(os.path.join(case_path, "solution.yaml")):
                 break
             else:
                 print(f"Retrying case {i} (attempt {attempt+1}/{max_attempts})")
         else:
             print(
-                f"Case {i}: Failed to generate a solvable instance after {max_attempts} attempts, skipping."
+                f"Case {i}: Failed after {max_attempts} attempts, skipping."
             )
-        gc.collect()  # free CBS search tree after every case
+        gc.collect()
     print(f"Cases stored in {path}")
 
 
